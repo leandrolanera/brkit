@@ -27,7 +27,7 @@ Toda resposta autenticada traz `x-ratelimit-*` e `x-usage-*`. Erros seguem o for
 ### Regras da plataforma
 
 - O limite por minuto conta toda requisição autenticada, inclusive as que falham.
-- A cota mensal (mês em UTC) só é debitada quando a resposta é bem-sucedida (< 400).
+- A cota mensal (mês em UTC) só é debitada quando a resposta é bem-sucedida (< 400). O débito é por reserva: a unidade é separada antes de chamar o endpoint e devolvida se a cota estourou ou se a resposta falhou, para que chamadas simultâneas na borda da cota não furem o limite. Um processo derrubado entre a reserva e a devolução deixa até `cost` unidades consumidas à toa, zeradas na virada do mês.
 - `withApi(handler, { cost: N })` cobra N unidades por chamada, o gancho para os endpoints com IA quando entrarem os créditos pré-pagos.
 - `withApi(handler, { cost: 0 })` não consome nem exige cota. É o caso dos endpoints de cobrança, que precisam funcionar justamente quando a cota acabou.
 - Os planos e preços em `lib/plans.ts` são provisórios (free 1.000 chamadas, pro R$ 49 com 50.000, scale R$ 249 com 500.000 por mês).

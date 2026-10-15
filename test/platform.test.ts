@@ -61,6 +61,127 @@ test("cota mensal esgotada → 402", async () => {
   assert.equal((await call(holidays, "/v1/holidays", key)).status, 402);
 });
 
+/** Store que registra as chamadas, para inspecionar reservas, estornos e TTL. */
+function spyStore(inner: Store): { store: Store; calls: string[] } {
+  const calls: string[] = [];
+  const store: Store = {
+    async get<T>(key: string) {
+      calls.push(`get ${key}`);
+      return inner.get<T>(key);
+    },
+    async set(key, value, opts) {
+      calls.push(`set ${key}`);
+      return inner.set(key, value, opts);
+    },
+    async incr(key) {
+      calls.push(`incr ${key}`);
+      return inner.incr(key);
+    },
+    async incrBy(key, amount) {
+      calls.push(`incrBy ${key} ${amount}`);
+      return inner.incrBy(key, amount);
+    },
+    async expire(key, seconds) {
+      calls.push(`expire ${key} ${seconds}`);
+      return inner.expire(key, seconds);
+    },
+  };
+  return { store, calls };
+}
+
+const usageMonth = () => new Date().toISOString().slice(0, 7);
+
+test("chamadas simultâneas na borda da cota não furam o limite", async () => {
+  const { key, record } = await createApiKey(store, "teste", "free");
+  const usage = `usage:${record.id}:${usageMonth()}`;
+  await store.set(usage, 999);
+
+  // Ler e só depois incrementar deixaria as duas passarem pela mesma verificação.
+  const [a, b] = await Promise.all([call(holidays, "/v1/holidays", key), call(holidays, "/v1/holidays", key)]);
+
+  const statuses = [a.status, b.status].sort();
+  assert.deepEqual(statuses, [200, 402]);
+  assert.equal(await store.get(usage), 1000, "a cota não pode passar do limite do plano");
+});
+
+test("402 por cota estourada estorna a reserva e não deixa resíduo", async () => {
+  const { key, record } = await createApiKey(store, "teste", "free");
+  const usage = `usage:${record.id}:${usageMonth()}`;
+  await store.set(usage, 1000);
+
+  const res = await call(holidays, "/v1/holidays", key);
+  assert.equal(res.status, 402);
+  assert.equal(res.headers.get("x-usage-remaining"), "0");
+  assert.equal(await store.get(usage), 1000, "a reserva recusada precisa voltar");
+});
+
+test("resposta 4xx do handler estorna a reserva", async () => {
+  const { key, record } = await createApiKey(store, "teste", "free");
+  const usage = `usage:${record.id}:${usageMonth()}`;
+  const failing = withApi(() => new Response("nope", { status: 400 }), { cost: 3 });
+
+  const res = await call(failing, "/x", key);
+  assert.equal(res.status, 400);
+  assert.equal(res.headers.get("x-usage-remaining"), "1000");
+  // O que importa é não ter consumido nada; a chave pode nem existir (nunca debitada)
+  // ou existir zerada (debitada e estornada) — as duas formas satisfazem o contrato.
+  assert.equal((await store.get<number>(usage)) ?? 0, 0, "nenhuma unidade pode ser consumida");
+});
+
+test("handler que quebra (500) estorna a reserva", async () => {
+  const { key, record } = await createApiKey(store, "teste", "free");
+  const usage = `usage:${record.id}:${usageMonth()}`;
+  const broken = withApi(() => {
+    throw new Error("falha no meio");
+  }, { cost: 4 });
+
+  assert.equal((await call(broken, "/x", key)).status, 500);
+  assert.equal((await store.get<number>(usage)) ?? 0, 0, "a reserva não usada precisa voltar");
+});
+
+test("a reserva é integral: cost que não cabe na cota não debita nada", async () => {
+  const { key, record } = await createApiKey(store, "teste", "free");
+  const usage = `usage:${record.id}:${usageMonth()}`;
+  await store.set(usage, 998);
+  const costly = withApi(() => new Response("ok"), { cost: 5 });
+
+  assert.equal((await call(costly, "/x", key)).status, 402);
+  assert.equal(await store.get(usage), 998, "não existe débito parcial");
+});
+
+test("o primeiro débito do mês define o TTL da chave de uso", async () => {
+  const inner = createMemoryStore();
+  const { store: spy, calls } = spyStore(inner);
+  setStore(spy);
+  const { key, record } = await createApiKey(inner, "teste", "free");
+  const usage = `usage:${record.id}:${usageMonth()}`;
+
+  await call(holidays, "/v1/holidays", key);
+  assert.ok(
+    calls.includes(`expire ${usage} ${62 * 24 * 3600}`),
+    "o TTL precisa ser definido no primeiro débito",
+  );
+
+  calls.length = 0;
+  await call(holidays, "/v1/holidays", key);
+  assert.ok(
+    !calls.some((c) => c.startsWith(`expire ${usage}`)),
+    "o TTL não deve ser redefinido nas chamadas seguintes",
+  );
+});
+
+test("cost 0 não reserva nem estorna", async () => {
+  const inner = createMemoryStore();
+  const { store: spy, calls } = spyStore(inner);
+  setStore(spy);
+  const { key, record } = await createApiKey(inner, "teste", "free");
+  const usage = `usage:${record.id}:${usageMonth()}`;
+
+  const free = withApi(() => new Response("ok"), { cost: 0 });
+  assert.equal((await call(free, "/x", key)).status, 200);
+  assert.ok(!calls.some((c) => c.startsWith(`incrBy ${usage}`)), "cost 0 não mexe no contador");
+});
+
 test("cost maior que 1 debita várias unidades", async () => {
   const { key } = await createApiKey(store, "teste", "free");
   const costly = withApi(() => new Response("ok"), { cost: 5 });
