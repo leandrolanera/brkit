@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import { afterEach, beforeEach, test } from "node:test";
-import { asaasConfigFromEnv, AsaasError, createAsaasClient } from "../lib/asaas.js";
-import { createApiKey, effectivePlan, getKeyRecordById, type KeyRecord } from "../lib/auth.js";
+import { asaasConfigFromEnv, AsaasError, createAsaasClient, type AsaasPayment } from "../lib/asaas.js";
+import { createApiKey, effectivePlan, getKeyRecordById, updateKeyPlan, type KeyRecord } from "../lib/auth.js";
 import {
   BillingError,
   cancelSubscription,
   getBillingStatus,
   handleAsaasEvent,
+  reconcileSubscription,
   startCheckout,
   todayInBrazil,
   type AsaasEvent,
@@ -40,12 +41,22 @@ function fakeAsaas(
     failSubscriptionList?: boolean;
     /** Faz a consulta de clientes falhar, que não deve interromper o checkout. */
     failCustomerList?: boolean;
+    /** Faz a consulta de cobranças falhar, para checar que o status não quebra. */
+    failPaymentList?: boolean;
   } = {},
 ) {
   let dropped = false;
+  /** Mutável: permite ligar a falha depois de montar o estado, no meio do teste. */
+  const fail = {
+    subscriptionList: opts.failSubscriptionList ?? false,
+    customerList: opts.failCustomerList ?? false,
+    paymentList: opts.failPaymentList ?? false,
+  };
   const calls: FakeCall[] = [];
   const customers = new Map<string, { id: string; ref: string; deleted: boolean }>();
   const subscriptions = new Map<string, { id: string; ref: string; value: number; status: string; deleted: boolean }>();
+  /** Cobranças por assinatura. Cada assinatura nasce com uma PENDING, como no Asaas. */
+  const payments = new Map<string, AsaasPayment[]>();
 
   const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
     const raw = String(input);
@@ -61,7 +72,7 @@ function fakeAsaas(
       new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json" } });
 
     if (method === "GET" && path === "/customers") {
-      if (opts.failCustomerList) return respond(500, { errors: [] });
+      if (fail.customerList) return respond(500, { errors: [] });
       return respond(200, { data: [...customers.values()].filter((c) => c.ref === ref && !c.deleted) });
     }
 
@@ -75,7 +86,7 @@ function fakeAsaas(
     }
 
     if (method === "GET" && path === "/subscriptions") {
-      if (opts.failSubscriptionList) return respond(500, { errors: [] });
+      if (fail.subscriptionList) return respond(500, { errors: [] });
       // Devolve também as removidas e inativas. Não está documentado que o Asaas as exclua da
       // listagem, então descartá-las é responsabilidade do nosso código — e só assim esse
       // filtro fica de fato coberto pelos testes.
@@ -91,6 +102,7 @@ function fakeAsaas(
         status: "ACTIVE",
         deleted: false,
       });
+      payments.set(id, [{ id: `pay_${id}`, status: "PENDING", invoiceUrl: "https://sandbox.asaas.com/i/abc" }]);
       if (opts.dropFirstSubscriptionResponse && !dropped) {
         dropped = true;
         // O Asaas já criou e vai cobrar; só a resposta não chega até nós.
@@ -99,11 +111,18 @@ function fakeAsaas(
       return respond(200, { id, status: "ACTIVE", paymentLink: null });
     }
 
-    const payments = path.match(/^\/subscriptions\/([^/]+)\/payments$/);
-    if (method === "GET" && payments) {
-      const sub = subscriptions.get(payments[1]!);
-      if (!sub) return respond(404, { errors: [{ code: "not_found", description: "assinatura inexistente" }] });
-      return respond(200, { data: [{ id: "pay_1", status: "PENDING", invoiceUrl: "https://sandbox.asaas.com/i/abc" }] });
+    const paymentsRoute = path.match(/^\/subscriptions\/([^/]+)\/payments$/);
+    if (method === "GET" && paymentsRoute) {
+      const subId = paymentsRoute[1]!;
+      if (!subscriptions.has(subId)) {
+        return respond(404, { errors: [{ code: "not_found", description: "assinatura inexistente" }] });
+      }
+      if (fail.paymentList) return respond(500, { errors: [] });
+      const wanted = url.searchParams.get("status");
+      const limit = Number(url.searchParams.get("limit") ?? 10);
+      const all = payments.get(subId) ?? [];
+      const filtered = wanted ? all.filter((pay) => pay.status === wanted) : all;
+      return respond(200, { data: filtered.slice(0, limit) });
     }
 
     const one = path.match(/^\/subscriptions\/([^/]+)$/);
@@ -123,7 +142,7 @@ function fakeAsaas(
   const callsTo = (method: string, path: string) =>
     calls.filter((c) => c.method === method && new URL(c.url).pathname.replace(/^\/v3/, "") === path);
 
-  return { fetchImpl, calls, callsTo, customers, subscriptions };
+  return { fetchImpl, calls, callsTo, customers, subscriptions, payments, fail };
 }
 
 let store: Store;
@@ -384,6 +403,198 @@ test("assinatura removida no Asaas não é adotada: contratar de novo continua p
   const again = await startCheckout({ store, asaas, now: NOW }, record, { plan: "scale", customer });
   assert.equal(again.subscription_id, "sub_2", "a cancelada não pode ser readotada");
   assert.equal(again.plan, "scale");
+});
+
+// --- reconciliação ---------------------------------------------------------
+//
+// O webhook é o único caminho que libera acesso, e ele falha de formas silenciosas: o Asaas
+// pausa a fila após 15 falhas seguidas, um deploy ruim perde eventos. O cliente fica sem o
+// acesso que pagou. A reconciliação reconstrói o direito a partir das cobranças.
+
+/** Assinatura ativa e paga no Asaas, mas com a chave sem acesso: o evento se perdeu. */
+async function lostEventState(fake: ReturnType<typeof fakeAsaas>) {
+  const asaas = client(fake);
+  const { key, record } = await newKey();
+  await startCheckout({ store, asaas, now: NOW }, record, { plan: "pro", customer });
+  // O Asaas confirmou a cobrança; o nosso lado nunca soube.
+  fake.payments.set("sub_1", [
+    { id: "pay_1", status: "CONFIRMED", dueDate: "2026-10-15", confirmedDate: "2026-10-15" },
+  ]);
+  const fresh = (await getKeyRecordById(store, record.id))!;
+  assert.equal(effectivePlan(fresh), "free", "a chave começa sem acesso pago");
+  return { asaas, key, record: fresh };
+}
+
+test("evento perdido: consultar o status reconstrói o acesso pago", async () => {
+  const fake = fakeAsaas();
+  const { asaas, record } = await lostEventState(fake);
+
+  const status = await getBillingStatus({ store, asaas }, record);
+
+  assert.equal(status.plan, "pro", "o acesso pago precisa voltar sem depender de evento");
+  assert.ok(status.plan_until);
+  const after = (await getKeyRecordById(store, record.id))!;
+  assert.equal(effectivePlan(after), "pro", "e ficar gravado, não só aparecer na resposta");
+});
+
+test("a reconciliação chega ao mesmo planUntil que o webhook teria gravado", async () => {
+  // A regra de direito ao acesso é uma só (paidUntil); duas implementações divergiriam.
+  const viaReconcile = await (async () => {
+    const fake = fakeAsaas();
+    const { asaas, record } = await lostEventState(fake);
+    await getBillingStatus({ store, asaas }, record);
+    return (await getKeyRecordById(store, record.id))!.planUntil;
+  })();
+
+  store = createMemoryStore();
+  setStore(store);
+
+  const viaWebhook = await (async () => {
+    const fake = fakeAsaas();
+    const asaas = client(fake);
+    const { record } = await newKey();
+    await startCheckout({ store, asaas, now: NOW }, record, { plan: "pro", customer });
+    await handleAsaasEvent(
+      store,
+      paymentEvent("evt_1", "PAYMENT_CONFIRMED", { dueDate: "2026-10-15", dateCreated: "2026-10-15 10:00:00" }),
+      NOW,
+    );
+    return (await getKeyRecordById(store, record.id))!.planUntil;
+  })();
+
+  // Não dá para serem idênticos: o evento traz `dateCreated` com hora, a cobrança traz só a
+  // data da confirmação. A regra (paidUntil) é uma só; a precisão da entrada é que difere.
+  // O invariante que importa é a direção: reconciliar nunca concede MENOS que o webhook, já
+  // que o evento se perdeu por falha nossa.
+  assert.ok(viaReconcile && viaWebhook);
+  assert.ok(
+    Date.parse(viaReconcile) >= Date.parse(viaWebhook),
+    `reconciliação (${viaReconcile}) não pode ficar antes do webhook (${viaWebhook})`,
+  );
+  assert.equal(viaReconcile.slice(0, 10), viaWebhook.slice(0, 10), "e cai no mesmo dia");
+});
+
+test("reconciliar é idempotente: repetir não muda o resultado", async () => {
+  const fake = fakeAsaas();
+  const { asaas, record } = await lostEventState(fake);
+
+  await getBillingStatus({ store, asaas }, record);
+  const primeiro = (await getKeyRecordById(store, record.id))!.planUntil;
+  const atualizada = (await getKeyRecordById(store, record.id))!;
+  await getBillingStatus({ store, asaas }, atualizada);
+  assert.equal((await getKeyRecordById(store, record.id))!.planUntil, primeiro);
+});
+
+test("só estende: não encurta um período pago já concedido", async () => {
+  // Exercita reconcileSubscription direto: pelo GET o gate exige acesso vencido, e um
+  // planUntil futuro faria a reconciliação nem rodar — o teste passaria sem testar nada.
+  const fake = fakeAsaas();
+  const { asaas, record } = await lostEventState(fake);
+
+  // Já concedido até depois do que a cobrança de 15/10 justifica, mas ainda no passado,
+  // para o estado continuar sendo o de "sem acesso pago vigente".
+  const concedido = new Date("2026-12-31T00:00:00.000Z").toISOString();
+  await updateKeyPlan(store, record.id, { plan: "pro", planUntil: concedido });
+  const atual = (await getKeyRecordById(store, record.id))!;
+
+  const result = await reconcileSubscription({ store, asaas, now: NOW }, atual);
+
+  assert.equal(result.plan_until, null, "não há o que estender");
+  assert.equal((await getKeyRecordById(store, record.id))!.planUntil, concedido);
+});
+
+test("estende quando a cobrança justifica mais do que já havia", async () => {
+  const fake = fakeAsaas();
+  const { asaas, record } = await lostEventState(fake);
+  const curto = new Date("2026-10-20T00:00:00.000Z").toISOString();
+  await updateKeyPlan(store, record.id, { plan: "pro", planUntil: curto });
+  const atual = (await getKeyRecordById(store, record.id))!;
+
+  const result = await reconcileSubscription({ store, asaas, now: NOW }, atual);
+
+  assert.ok(result.plan_until);
+  assert.ok(Date.parse(result.plan_until) > Date.parse(curto));
+});
+
+test("falha ao consultar assinaturas não marca a assinatura como cancelada", async () => {
+  // Marcar por causa de uma falha de rede liberaria um segundo checkout — exatamente a
+  // cobrança dupla que findActiveSubscription existe para evitar.
+  const fake = fakeAsaas();
+  const { asaas, record } = await lostEventState(fake);
+  fake.fail.subscriptionList = true;
+
+  const result = await reconcileSubscription({ store, asaas, now: NOW }, record);
+
+  assert.equal(result.subscription_cancelled, false);
+  const billing = await store.get<{ status: string }>(`billing:key:${record.id}`);
+  assert.equal(billing?.status, "active", "na dúvida, mantém como está");
+});
+
+test("cobrança estornada não dá direito a acesso", async () => {
+  const fake = fakeAsaas();
+  const { asaas, record } = await lostEventState(fake);
+  fake.payments.set("sub_1", [{ id: "pay_1", status: "REFUNDED", dueDate: "2026-10-15", confirmedDate: "2026-10-15" }]);
+
+  const status = await getBillingStatus({ store, asaas }, record);
+  assert.equal(status.plan, "free");
+  assert.equal(status.plan_until, null);
+});
+
+test("no caminho saudável não consulta as cobranças à toa", async () => {
+  const fake = fakeAsaas();
+  const asaas = client(fake);
+  const { record } = await newKey();
+  await startCheckout({ store, asaas, now: NOW }, record, { plan: "pro", customer });
+  await updateKeyPlan(store, record.id, {
+    plan: "pro",
+    planUntil: new Date(NOW.getTime() + 20 * 86_400_000).toISOString(),
+  });
+
+  const saudavel = (await getKeyRecordById(store, record.id))!;
+  const antes = fake.callsTo("GET", "/subscriptions/sub_1/payments").length;
+  await getBillingStatus({ store, asaas }, saudavel);
+  const depois = fake.callsTo("GET", "/subscriptions/sub_1/payments").length;
+
+  // Uma única chamada, a do link pendente, que já existia antes da reconciliação.
+  assert.equal(depois - antes, 1, "acesso pago vigente não precisa de reconciliação");
+});
+
+test("assinatura removida no painel do Asaas é marcada como cancelada", async () => {
+  const fake = fakeAsaas();
+  const asaas = client(fake);
+  const { record } = await newKey();
+  await startCheckout({ store, asaas, now: NOW }, record, { plan: "pro", customer });
+  // Cancelada direto no Asaas, sem o evento chegar até nós.
+  fake.subscriptions.get("sub_1")!.deleted = true;
+  fake.subscriptions.get("sub_1")!.status = "INACTIVE";
+
+  const status = await getBillingStatus({ store, asaas }, record);
+  assert.equal(status.subscription?.status, "cancelled");
+
+  // E o principal: contratar de novo volta a ser possível.
+  const novo = await startCheckout({ store, asaas, now: NOW }, record, { plan: "pro", customer });
+  assert.equal(novo.subscription_id, "sub_2");
+});
+
+test("falha ao reconciliar não derruba a consulta de status", async () => {
+  const fake = fakeAsaas({ failPaymentList: true });
+  const asaas = client(fake);
+  const { record } = await newKey();
+  await startCheckout({ store, asaas, now: NOW }, record, { plan: "pro", customer });
+
+  const status = await getBillingStatus({ store, asaas }, record);
+  assert.equal(status.plan, "free", "status é leitura: responde com o que sabe");
+  assert.equal(status.subscription?.id, "sub_1");
+});
+
+test("sem assinatura não há o que reconciliar", async () => {
+  const fake = fakeAsaas();
+  const asaas = client(fake);
+  const { record } = await newKey();
+
+  const status = await getBillingStatus({ store, asaas }, record);
+  assert.equal(status.subscription, null);
+  assert.equal(fake.calls.length, 0, "nem chega a falar com o Asaas");
 });
 
 // --- webhook: lógica -------------------------------------------------------

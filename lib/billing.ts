@@ -130,7 +130,7 @@ async function recordSubscription(
 
 async function findPaymentUrl(asaas: AsaasClient, subscriptionId: string, status?: string): Promise<string | null> {
   try {
-    const list = await asaas.listSubscriptionPayments(subscriptionId, status);
+    const list = await asaas.listSubscriptionPayments(subscriptionId, { status });
     return list.data?.find((p) => typeof p.invoiceUrl === "string" && p.invoiceUrl)?.invoiceUrl ?? null;
   } catch (err) {
     console.warn("asaas_list_payments_failed", err instanceof AsaasError ? err.status : "unknown");
@@ -236,12 +236,131 @@ export async function startCheckout(
   return { subscription_id: subscription.id, plan: input.plan, price_brl: price, payment_url: paymentUrl };
 }
 
+// ---------------------------------------------------------------------------
+// Reconciliação
+
+/** Uma assinatura mensal leva mais de 8 anos para passar disso; 100 é o teto do Asaas. */
+const RECONCILE_PAYMENT_LIMIT = 100;
+
+/** Status de cobrança que dão direito ao acesso. Estornada e com chargeback ficam de fora. */
+const PAID_STATUSES = new Set(["CONFIRMED", "RECEIVED", "RECEIVED_IN_CASH"]);
+
+export interface ReconcileResult {
+  /** true quando algo mudou no estado da chave ou da assinatura. */
+  changed: boolean;
+  /** Novo fim do período pago, quando a reconciliação estendeu o acesso. */
+  plan_until: string | null;
+  /** true quando a assinatura foi marcada como cancelada por já não existir no Asaas. */
+  subscription_cancelled: boolean;
+}
+
+const NOTHING_TO_DO: ReconcileResult = { changed: false, plan_until: null, subscription_cancelled: false };
+
+/**
+ * Recalcula o acesso a partir das cobranças que o Asaas realmente tem.
+ *
+ * O webhook é o único caminho que libera acesso, e ele pode falhar de formas que ninguém
+ * percebe: o Asaas pausa a fila depois de 15 falhas seguidas, um deploy com erro perde eventos,
+ * e o cliente fica sem o acesso que pagou. A reconciliação fecha essa lacuna sem depender de
+ * evento nenhum — lê o histórico de cobranças e aplica a mesma regra (`paidUntil`).
+ *
+ * É idempotente por construção: parte do estado das cobranças, não de eventos, então rodar duas
+ * vezes dá o mesmo resultado.
+ *
+ * **Só estende, nunca encurta.** Encurtar aqui atropelaria uma revogação por estorno já
+ * aplicada pelo webhook. A cobrança estornada não entra na conta (o status dela sai de
+ * PAID_STATUSES), mas as que foram pagas e mantidas continuam valendo — então um estorno
+ * pontual não apaga o período que outras cobranças já cobriram.
+ */
+export async function reconcileSubscription(
+  deps: { store: Store; asaas: AsaasClient; now?: Date },
+  key: KeyRecord,
+): Promise<ReconcileResult> {
+  const { store, asaas } = deps;
+  const now = deps.now ?? new Date();
+
+  const record = await store.get<BillingRecord>(keyBillingKey(key.id));
+  if (!record) return NOTHING_TO_DO;
+
+  const payments = await asaas.listSubscriptionPayments(record.subscriptionId, {
+    limit: RECONCILE_PAYMENT_LIMIT,
+  });
+
+  let until = 0;
+  for (const payment of payments.data ?? []) {
+    if (!PAID_STATUSES.has(String(payment.status))) continue;
+    const due = parseDateOnly(asString(payment.dueDate)) ?? 0;
+    // O evento do webhook traz `dateCreated` com hora; o objeto da cobrança traz só a data da
+    // confirmação. Lemos essa data como o FIM do dia para que a reconciliação nunca conceda
+    // menos acesso do que o evento teria concedido: o evento se perdeu por falha nossa, então
+    // a imprecisão corre a favor do cliente.
+    const confirmedDay = parseDateOnly(asString(payment.confirmedDate ?? payment.paymentDate));
+    const confirmed = confirmedDay === null ? 0 : confirmedDay + DAY_MS - 1;
+    until = Math.max(until, paidUntil(due, confirmed, now));
+  }
+
+  const current = key.plan === record.plan && key.planUntil ? Date.parse(key.planUntil) : 0;
+  let planUntil: string | null = null;
+  if (until > current) {
+    planUntil = new Date(until).toISOString();
+    await updateKeyPlan(store, key.id, { plan: record.plan, planUntil });
+  }
+
+  // A assinatura pode ter sido removida no painel do Asaas sem que o evento chegasse, o que
+  // deixaria o registro preso em "active" e impediria contratar de novo.
+  let cancelled = false;
+  if (record.status === "active" && !(await subscriptionStillActive(asaas, key.id, record.subscriptionId))) {
+    await store.set(keyBillingKey(key.id), { ...record, status: "cancelled" } satisfies BillingRecord);
+    cancelled = true;
+  }
+
+  return { changed: planUntil !== null || cancelled, plan_until: planUntil, subscription_cancelled: cancelled };
+}
+
+/**
+ * Se a assinatura continua ativa no Asaas.
+ *
+ * Diante de erro devolve true (ou seja, não mexe no registro): marcar como cancelada por causa
+ * de uma falha de rede liberaria um segundo checkout e levaria à cobrança dupla que o
+ * findActiveSubscription existe para evitar.
+ */
+async function subscriptionStillActive(asaas: AsaasClient, keyId: string, subscriptionId: string): Promise<boolean> {
+  try {
+    const list = await asaas.listSubscriptions(keyId);
+    const found = list.data?.find((s) => s.id === subscriptionId);
+    if (!found) return false;
+    return found.deleted !== true && found.status === "ACTIVE";
+  } catch (err) {
+    console.warn("asaas_list_subscriptions_failed", err instanceof AsaasError ? err.status : "unknown");
+    return true;
+  }
+}
+
 export async function getBillingStatus(deps: { store: Store; asaas: AsaasClient | null }, key: KeyRecord) {
   const { store, asaas } = deps;
-  const record = await store.get<BillingRecord>(keyBillingKey(key.id));
-  const plan = effectivePlan(key);
+  let current = key;
+  let record = await store.get<BillingRecord>(keyBillingKey(current.id));
+
+  // Assinatura ativa sem acesso pago vigente é exatamente o sintoma de um evento perdido —
+  // e também o estado normal de quem ainda não pagou. Consultar o Asaas resolve qual dos dois
+  // é o caso, e só aqui: no caminho saudável a reconciliação não custa nada.
+  if (asaas && record?.status === "active" && effectivePlan(current) === "free") {
+    try {
+      const result = await reconcileSubscription({ store, asaas }, current);
+      if (result.changed) {
+        console.info("billing_reconciled", current.id, result);
+        current = (await getKeyRecordById(store, current.id)) ?? current;
+        record = await store.get<BillingRecord>(keyBillingKey(current.id));
+      }
+    } catch (err) {
+      // Status é leitura: uma falha ao reconciliar não pode derrubar a resposta.
+      console.warn("billing_reconcile_failed", current.id, err instanceof AsaasError ? err.status : "unknown");
+    }
+  }
+
+  const plan = effectivePlan(current);
   const month = new Date().toISOString().slice(0, 7);
-  const used = (await store.get<number>(`usage:${key.id}:${month}`)) ?? 0;
+  const used = (await store.get<number>(`usage:${current.id}:${month}`)) ?? 0;
 
   let pendingPaymentUrl: string | null = null;
   if (record?.status === "active" && asaas) {
@@ -250,8 +369,8 @@ export async function getBillingStatus(deps: { store: Store; asaas: AsaasClient 
 
   return {
     plan,
-    contracted_plan: key.plan,
-    plan_until: key.planUntil ?? null,
+    contracted_plan: current.plan,
+    plan_until: current.planUntil ?? null,
     subscription: record ? { id: record.subscriptionId, plan: record.plan, status: record.status } : null,
     pending_payment_url: pendingPaymentUrl,
     usage: { month, used, limit: PLANS[plan].monthlyQuota },
@@ -301,6 +420,23 @@ export interface AsaasEvent {
 
 export type EventOutcome = "processed" | "ignored" | "duplicate";
 
+/**
+ * Fim do período pago por uma cobrança: ciclo + tolerância sobre o que for mais tarde entre o
+ * vencimento e o momento em que o pagamento se confirmou. Quem paga adiantado continua o ciclo
+ * normal; quem paga muito atrasado ainda recebe o mês inteiro.
+ *
+ * Única definição da regra de direito ao acesso, usada pelo webhook e pela reconciliação. Duas
+ * implementações disso divergiriam com o tempo, e a divergência apareceria como cliente sem o
+ * acesso que pagou.
+ *
+ * Os dois argumentos são milissegundos, e 0 significa "não informado": sem nenhum dos dois, a
+ * base é o agora.
+ */
+export function paidUntil(dueDateMs: number, confirmedAtMs: number, now: Date): number {
+  const base = Math.max(dueDateMs, confirmedAtMs) || now.getTime();
+  return base + (BILLING_CYCLE_DAYS + GRACE_DAYS) * DAY_MS;
+}
+
 /** Pix só emite RECEIVED; boleto e cartão emitem CONFIRMED e depois RECEIVED. Qualquer um libera o acesso. */
 const GRANT_EVENTS = new Set(["PAYMENT_CONFIRMED", "PAYMENT_RECEIVED"]);
 const REVOKE_EVENTS = new Set(["PAYMENT_REFUNDED", "PAYMENT_CHARGEBACK_REQUESTED"]);
@@ -337,12 +473,9 @@ async function grantAccess(store: Store, event: AsaasEvent, now: Date): Promise<
   const key = await getKeyRecordById(store, index.keyId);
   if (!key) return "ignored";
 
-  // Base = o que for mais tarde entre o vencimento e o momento do evento: quem paga adiantado
-  // continua o ciclo normal e quem paga muito atrasado ainda recebe o mês inteiro.
   const due = parseDateOnly(asString(event.payment?.dueDate)) ?? 0;
   const eventTime = parseAsaasTimestamp(asString(event.dateCreated)) ?? 0;
-  const base = Math.max(due, eventTime) || now.getTime();
-  const until = base + (BILLING_CYCLE_DAYS + GRACE_DAYS) * DAY_MS;
+  const until = paidUntil(due, eventTime, now);
 
   const previous = key.plan === index.plan && key.planUntil ? Date.parse(key.planUntil) : 0;
   await updateKeyPlan(store, index.keyId, {

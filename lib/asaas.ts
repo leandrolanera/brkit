@@ -18,6 +18,10 @@ export interface AsaasPayment {
   status?: string;
   invoiceUrl?: string;
   dueDate?: string;
+  /** AAAA-MM-DD. Quando o Asaas confirmou a cobrança. */
+  confirmedDate?: string;
+  /** AAAA-MM-DD. Quando o pagamento foi efetivado. */
+  paymentDate?: string;
 }
 
 export interface AsaasSubscription {
@@ -102,8 +106,11 @@ export function createAsaasClient(config: AsaasConfig) {
       return request<unknown>("DELETE", `/subscriptions/${encodeURIComponent(id)}`);
     },
 
-    listSubscriptionPayments(id: string, status?: string) {
-      const query = status ? `?status=${encodeURIComponent(status)}` : "";
+    listSubscriptionPayments(id: string, opts: { status?: string; limit?: number } = {}) {
+      const params = new URLSearchParams();
+      if (opts.status) params.set("status", opts.status);
+      if (opts.limit !== undefined) params.set("limit", String(opts.limit));
+      const query = params.size > 0 ? `?${params}` : "";
       return request<{ data?: AsaasPayment[] }>("GET", `/subscriptions/${encodeURIComponent(id)}/payments${query}`);
     },
 

@@ -66,6 +66,16 @@ Por isso o checkout **procura antes de criar**, filtrando as assinaturas pelo `e
 
 O mesmo vale para o cliente, com consequência menor: cliente duplicado não cobra ninguém, então ali a falha na consulta não interrompe o checkout.
 
+**Reconciliação (quando o webhook falha).** O webhook é o único caminho que libera acesso, e ele falha de formas que ninguém percebe: o Asaas pausa a fila depois de 15 falhas seguidas, um deploy com erro perde eventos. O resultado seria o cliente sem o acesso que pagou.
+
+`GET /v1/billing` reconstrói o direito a partir das cobranças que o Asaas realmente tem, sem depender de evento nenhum. Isso roda **só quando o estado é suspeito** — assinatura ativa e sem acesso pago vigente, que é exatamente o sintoma de um evento perdido (e também o estado normal de quem ainda não pagou). No caminho saudável não há chamada extra.
+
+- Aplica a mesma regra do webhook (`paidUntil`): uma definição só, porque duas divergiriam e a divergência apareceria como cliente sem acesso.
+- É idempotente: parte do estado das cobranças, não de eventos.
+- **Só estende, nunca encurta.** Cobrança estornada não entra na conta, mas as pagas e mantidas continuam valendo, então um estorno pontual não apaga o período que outras já cobriram.
+- Também sincroniza a assinatura: removida no painel do Asaas sem o evento chegar, ela ficaria presa em `active` e impediria contratar de novo. Se a consulta falhar, nada é marcado — cancelar por engano liberaria um segundo checkout.
+- O evento traz `dateCreated` com hora, mas a cobrança traz só a data da confirmação. Essa data é lida como o **fim** do dia, para que um evento perdido nunca custe acesso: a falha foi nossa.
+
 ### Configuração
 
 1. No Asaas, gere a chave de API do ambiente que for usar (a do sandbox e a de produção são diferentes e só aparecem uma vez).
