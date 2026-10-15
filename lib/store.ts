@@ -56,7 +56,14 @@ class MemoryStore implements Store {
   }
 }
 
-class RedisStore implements Store {
+/**
+ * Store sobre o Redis (Upstash).
+ *
+ * Exportada para os testes, que injetam um duplo no lugar do cliente real.
+ * O construtor é tipado com o `Redis` de verdade de propósito: é isso que mantém as chamadas
+ * daqui verificadas contra os tipos do pacote (ver o comentário em `set`).
+ */
+export class RedisStore implements Store {
   constructor(private redis: Redis) {}
 
   async get<T>(key: string) {
