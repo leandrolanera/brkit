@@ -55,6 +55,17 @@ curl -X POST https://SEU-DOMINIO/v1/billing/checkout \
 | `SUBSCRIPTION_DELETED`, `SUBSCRIPTION_INACTIVATED` | Marca a assinatura como cancelada; o acesso pago continua até o fim do período |
 | demais | Ignorados (respondem 200) |
 
+**Contra cobrança em dobro.** `POST /subscriptions` não é idempotente e o Asaas não oferece `Idempotency-Key`. Se a resposta se perdesse depois de o Asaas já ter criado a assinatura, repetir o checkout criaria a segunda: o cliente seria cobrado duas vezes e o cancelamento só conheceria a última, deixando a primeira cobrando indefinidamente.
+
+Por isso o checkout **procura antes de criar**, filtrando as assinaturas pelo `externalReference` (o id da chave), que é o caminho de reconciliação indicado pelo Asaas:
+
+- Achou assinatura ativa e nosso Redis não a conhecia: ela é adotada (passa a aparecer em `GET /v1/billing` e a ser cancelável por `DELETE /v1/billing`) em vez de criar outra. O plano vem do valor que está sendo cobrado de verdade, não do que foi pedido.
+- Achou e o plano pedido é outro: adota e devolve 409. A recusa não pode esconder uma cobrança real.
+- Achou com valor fora dos planos atuais: 409 `subscription_conflict` com o id da assinatura, sem adivinhar plano.
+- **A consulta falhou: o checkout falha também**, sem criar nada. Para dinheiro, falhar fechando é o lado certo de errar.
+
+O mesmo vale para o cliente, com consequência menor: cliente duplicado não cobra ninguém, então ali a falha na consulta não interrompe o checkout.
+
 ### Configuração
 
 1. No Asaas, gere a chave de API do ambiente que for usar (a do sandbox e a de produção são diferentes e só aparecem uma vez).
@@ -75,6 +86,7 @@ Atenção: o Asaas pode pausar a fila do webhook depois de 15 falhas seguidas. O
 - O documento do cliente (CPF/CNPJ) vai direto ao Asaas e não é guardado aqui; só o id do cliente e da assinatura ficam no Redis.
 - Criar a chave free ainda é manual (`npm run create-key`). Falta um cadastro público com verificação de e-mail.
 - Não verificado ainda contra o Asaas real: se o link da fatura da primeira cobrança já está disponível logo após criar a assinatura (se não estiver, `payment_url` vem nulo e `GET /v1/billing` devolve o link em `pending_payment_url`), se o cadastro de cliente aceita CNPJ alfanumérico e se há restrições para o domínio de `BILLING_SUCCESS_URL`.
+- Também não verificado: se `GET /subscriptions?externalReference=` devolve as assinaturas já removidas. Assumimos que **sim** e descartamos as que vêm com `deleted: true` ou status diferente de `ACTIVE` — se o Asaas já as excluir, o filtro é redundância inofensiva; se não, ele é o que impede uma assinatura cancelada de ser readotada.
 
 ## Outros limites conhecidos
 

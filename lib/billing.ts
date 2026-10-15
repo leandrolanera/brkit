@@ -63,6 +63,71 @@ function parseAsaasTimestamp(value: string | null): number | null {
   return Number.isNaN(ms) ? null : ms;
 }
 
+/** Plano reconhecido pela mensalidade. Usado para adotar uma assinatura que já existe no Asaas. */
+function planFromPrice(value: unknown): PaidPlanId | null {
+  if (typeof value !== "number") return null;
+  for (const plan of ["pro", "scale"] as const) {
+    if (PLANS[plan].priceBRL === value) return plan;
+  }
+  return null;
+}
+
+/**
+ * Assinatura ativa que já exista no Asaas para esta chave.
+ *
+ * `POST /subscriptions` não é idempotente e o Asaas não oferece Idempotency-Key. Se a resposta
+ * se perder depois de o Asaas ter criado a assinatura, uma nova tentativa criaria a segunda: o
+ * cliente passaria a ser cobrado duas vezes e o cancelamento só conheceria a última, deixando a
+ * primeira cobrando indefinidamente. Por isso procuramos antes de criar, pelo
+ * `externalReference` (o id da chave), que é o caminho de reconciliação indicado pelo Asaas.
+ *
+ * Um erro aqui sobe de propósito: sem conseguir consultar, criar arriscaria a cobrança dupla.
+ * Para dinheiro, falhar fechando é o lado certo de errar.
+ */
+async function findActiveSubscription(asaas: AsaasClient, keyId: string): Promise<{ id: string; value?: number } | null> {
+  const list = await asaas.listSubscriptions(keyId);
+  return list.data?.find((s) => s.id && s.deleted !== true && s.status === "ACTIVE") ?? null;
+}
+
+/**
+ * Cliente que já exista no Asaas para esta chave.
+ *
+ * Mesmo problema do checkout, consequência bem menor: cliente duplicado não cobra ninguém.
+ * Então aqui a falha na consulta não interrompe — segue e cria.
+ */
+async function findExistingCustomer(asaas: AsaasClient, keyId: string): Promise<string | null> {
+  try {
+    const list = await asaas.listCustomers(keyId);
+    return list.data?.find((c) => c.id && c.deleted !== true)?.id ?? null;
+  } catch (err) {
+    console.warn("asaas_list_customers_failed", err instanceof AsaasError ? err.status : "unknown");
+    return null;
+  }
+}
+
+/**
+ * Grava a assinatura dos dois lados do índice.
+ *
+ * O índice por assinatura vem primeiro de propósito: se a segunda gravação falhar, o webhook
+ * ainda consegue mapear pagamento → chave e liberar o acesso que o cliente pagou. Na ordem
+ * inversa, o pagamento chegaria sem efeito, que é o pior dos dois estados incompletos.
+ */
+async function recordSubscription(
+  store: Store,
+  keyId: string,
+  subscriptionId: string,
+  plan: PaidPlanId,
+  now: Date,
+): Promise<void> {
+  await store.set(subscriptionKey(subscriptionId), { keyId, plan } satisfies SubscriptionIndex);
+  await store.set(keyBillingKey(keyId), {
+    subscriptionId,
+    plan,
+    status: "active",
+    createdAt: now.toISOString(),
+  } satisfies BillingRecord);
+}
+
 async function findPaymentUrl(asaas: AsaasClient, subscriptionId: string, status?: string): Promise<string | null> {
   try {
     const list = await asaas.listSubscriptionPayments(subscriptionId, status);
@@ -104,16 +169,51 @@ export async function startCheckout(
     );
   }
 
+  // Antes de criar qualquer coisa: a tentativa anterior pode ter criado a assinatura sem que
+  // a resposta tenha chegado até aqui. Ver findActiveSubscription.
+  const existing = await findActiveSubscription(asaas, key.id);
+  if (existing) {
+    const plan = planFromPrice(existing.value);
+    if (!plan) {
+      throw new BillingError(
+        409,
+        "subscription_conflict",
+        `Existe uma assinatura ativa (${existing.id}) cujo valor não corresponde a nenhum plano atual. Cancele-a no Asaas antes de contratar.`,
+      );
+    }
+    // Adota antes de qualquer recusa: ela está cobrando de verdade, então precisa aparecer em
+    // GET /v1/billing e ser cancelável por DELETE /v1/billing.
+    await recordSubscription(store, key.id, existing.id, plan, now);
+    if (plan !== input.plan) {
+      throw new BillingError(
+        409,
+        "subscription_exists",
+        `Já existe uma assinatura ativa no plano ${plan} para esta chave. Cancele-a antes de contratar outro plano.`,
+      );
+    }
+    return {
+      subscription_id: existing.id,
+      plan,
+      price_brl: PLANS[plan].priceBRL,
+      payment_url: await findPaymentUrl(asaas, existing.id),
+    };
+  }
+
   let customerId = await store.get<string>(customerKey(key.id));
   if (!customerId) {
-    const customer = await asaas.createCustomer({
-      name: input.customer.name,
-      cpfCnpj: input.customer.document,
-      email: input.customer.email,
-      externalReference: key.id,
-    });
-    if (!customer?.id) throw new BillingError(502, "payment_provider_error", "Resposta inesperada do provedor de pagamento.");
-    customerId = customer.id;
+    customerId = await findExistingCustomer(asaas, key.id);
+    if (!customerId) {
+      const customer = await asaas.createCustomer({
+        name: input.customer.name,
+        cpfCnpj: input.customer.document,
+        email: input.customer.email,
+        externalReference: key.id,
+      });
+      if (!customer?.id) {
+        throw new BillingError(502, "payment_provider_error", "Resposta inesperada do provedor de pagamento.");
+      }
+      customerId = customer.id;
+    }
     await store.set(customerKey(key.id), customerId);
   }
 
@@ -130,13 +230,7 @@ export async function startCheckout(
   });
   if (!subscription?.id) throw new BillingError(502, "payment_provider_error", "Resposta inesperada do provedor de pagamento.");
 
-  await store.set(subscriptionKey(subscription.id), { keyId: key.id, plan: input.plan } satisfies SubscriptionIndex);
-  await store.set(keyBillingKey(key.id), {
-    subscriptionId: subscription.id,
-    plan: input.plan,
-    status: "active",
-    createdAt: now.toISOString(),
-  } satisfies BillingRecord);
+  await recordSubscription(store, key.id, subscription.id, input.plan, now);
 
   const paymentUrl = (await findPaymentUrl(asaas, subscription.id)) ?? subscription.paymentLink ?? null;
   return { subscription_id: subscription.id, plan: input.plan, price_brl: price, payment_url: paymentUrl };

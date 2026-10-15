@@ -20,6 +20,14 @@ export interface AsaasPayment {
   dueDate?: string;
 }
 
+export interface AsaasSubscription {
+  id: string;
+  status?: string;
+  /** Mensalidade cobrada. Serve para reconhecer o plano de uma assinatura órfã. */
+  value?: number;
+  deleted?: boolean;
+}
+
 export class AsaasError extends Error {
   constructor(
     public readonly status: number,
@@ -97,6 +105,21 @@ export function createAsaasClient(config: AsaasConfig) {
     listSubscriptionPayments(id: string, status?: string) {
       const query = status ? `?status=${encodeURIComponent(status)}` : "";
       return request<{ data?: AsaasPayment[] }>("GET", `/subscriptions/${encodeURIComponent(id)}/payments${query}`);
+    },
+
+    /**
+     * Assinaturas com um `externalReference`. É o caminho de reconciliação recomendado pela
+     * documentação do Asaas, e o que permite achar uma assinatura criada numa tentativa cuja
+     * resposta se perdeu.
+     */
+    listSubscriptions(externalReference: string) {
+      const query = `?externalReference=${encodeURIComponent(externalReference)}`;
+      return request<{ data?: AsaasSubscription[] }>("GET", `/subscriptions${query}`);
+    },
+
+    listCustomers(externalReference: string) {
+      const query = `?externalReference=${encodeURIComponent(externalReference)}`;
+      return request<{ data?: { id?: string; deleted?: boolean }[] }>("GET", `/customers${query}`);
     },
   };
 }
