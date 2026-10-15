@@ -242,8 +242,15 @@ export async function startCheckout(
 /** Uma assinatura mensal leva mais de 8 anos para passar disso; 100 é o teto do Asaas. */
 const RECONCILE_PAYMENT_LIMIT = 100;
 
-/** Status de cobrança que dão direito ao acesso. Estornada e com chargeback ficam de fora. */
-const PAID_STATUSES = new Set(["CONFIRMED", "RECEIVED", "RECEIVED_IN_CASH"]);
+/**
+ * Status de cobrança que dão direito ao acesso, espelhando GRANT_EVENTS.
+ *
+ * Ficam de fora, além dos óbvios PENDING e OVERDUE: REFUNDED, REFUND_REQUESTED,
+ * REFUND_IN_PROGRESS, CHARGEBACK_REQUESTED, CHARGEBACK_DISPUTE,
+ * AWAITING_CHARGEBACK_REVERSAL e AWAITING_RISK_ANALYSIS — em todos eles o dinheiro ou não
+ * chegou, ou está saindo.
+ */
+const PAID_STATUSES = new Set(["CONFIRMED", "RECEIVED", "RECEIVED_IN_CASH", "DUNNING_RECEIVED"]);
 
 export interface ReconcileResult {
   /** true quando algo mudou no estado da chave ou da assinatura. */
@@ -290,13 +297,13 @@ export async function reconcileSubscription(
   for (const payment of payments.data ?? []) {
     if (!PAID_STATUSES.has(String(payment.status))) continue;
     const due = parseDateOnly(asString(payment.dueDate)) ?? 0;
-    // O evento do webhook traz `dateCreated` com hora; o objeto da cobrança traz só a data da
-    // confirmação. Lemos essa data como o FIM do dia para que a reconciliação nunca conceda
-    // menos acesso do que o evento teria concedido: o evento se perdeu por falha nossa, então
-    // a imprecisão corre a favor do cliente.
-    const confirmedDay = parseDateOnly(asString(payment.confirmedDate ?? payment.paymentDate));
-    const confirmed = confirmedDay === null ? 0 : confirmedDay + DAY_MS - 1;
-    until = Math.max(until, paidUntil(due, confirmed, now));
+    // O evento do webhook traz `dateCreated` com hora; o objeto da cobrança só tem datas sem
+    // hora. Lemos a data como o FIM do dia para que a reconciliação nunca conceda menos acesso
+    // do que o evento teria concedido: o evento se perdeu por falha nossa, então a imprecisão
+    // corre a favor do cliente.
+    const paidDay = parseDateOnly(asString(payment.paymentDate ?? payment.clientPaymentDate));
+    const paidAt = paidDay === null ? 0 : paidDay + DAY_MS - 1;
+    until = Math.max(until, paidUntil(due, paidAt, now));
   }
 
   const current = key.plan === record.plan && key.planUntil ? Date.parse(key.planUntil) : 0;
@@ -437,8 +444,14 @@ export function paidUntil(dueDateMs: number, confirmedAtMs: number, now: Date): 
   return base + (BILLING_CYCLE_DAYS + GRACE_DAYS) * DAY_MS;
 }
 
-/** Pix só emite RECEIVED; boleto e cartão emitem CONFIRMED e depois RECEIVED. Qualquer um libera o acesso. */
-const GRANT_EVENTS = new Set(["PAYMENT_CONFIRMED", "PAYMENT_RECEIVED"]);
+/**
+ * Eventos que significam dinheiro recebido, e por isso liberam o acesso.
+ *
+ * Pix só emite RECEIVED; boleto e cartão emitem CONFIRMED e depois RECEIVED. DUNNING_RECEIVED
+ * é a cobrança recuperada por negativação — chega depois do vencimento, mas é pagamento igual,
+ * e ignorá-lo deixaria sem acesso quem acabou de quitar a dívida.
+ */
+const GRANT_EVENTS = new Set(["PAYMENT_CONFIRMED", "PAYMENT_RECEIVED", "PAYMENT_DUNNING_RECEIVED"]);
 const REVOKE_EVENTS = new Set(["PAYMENT_REFUNDED", "PAYMENT_CHARGEBACK_REQUESTED"]);
 const CANCEL_EVENTS = new Set(["SUBSCRIPTION_DELETED", "SUBSCRIPTION_INACTIVATED"]);
 

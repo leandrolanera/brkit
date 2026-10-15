@@ -17,11 +17,12 @@ export interface AsaasPayment {
   id: string;
   status?: string;
   invoiceUrl?: string;
+  /** AAAA-MM-DD. */
   dueDate?: string;
-  /** AAAA-MM-DD. Quando o Asaas confirmou a cobrança. */
-  confirmedDate?: string;
-  /** AAAA-MM-DD. Quando o pagamento foi efetivado. */
+  /** AAAA-MM-DD. Quando a cobrança foi paga no sistema do Asaas. */
   paymentDate?: string;
+  /** AAAA-MM-DD. Quando o cliente efetivamente quitou (pode ser anterior ao paymentDate). */
+  clientPaymentDate?: string;
 }
 
 export interface AsaasSubscription {

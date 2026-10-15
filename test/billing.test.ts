@@ -87,10 +87,10 @@ function fakeAsaas(
 
     if (method === "GET" && path === "/subscriptions") {
       if (fail.subscriptionList) return respond(500, { errors: [] });
-      // Devolve também as removidas e inativas. Não está documentado que o Asaas as exclua da
-      // listagem, então descartá-las é responsabilidade do nosso código — e só assim esse
-      // filtro fica de fato coberto pelos testes.
-      return respond(200, { data: [...subscriptions.values()].filter((sub) => sub.ref === ref) });
+      // Fiel ao Asaas: as removidas ficam fora por padrão (só entram com includeDeleted ou
+      // deletedOnly), mas EXPIRED e INACTIVE não são removidas e voltam na listagem. É por
+      // isso que filtrar por status === "ACTIVE" aqui do nosso lado é decisivo, não redundância.
+      return respond(200, { data: [...subscriptions.values()].filter((sub) => sub.ref === ref && !sub.deleted) });
     }
 
     if (method === "POST" && path === "/subscriptions") {
@@ -418,7 +418,7 @@ async function lostEventState(fake: ReturnType<typeof fakeAsaas>) {
   await startCheckout({ store, asaas, now: NOW }, record, { plan: "pro", customer });
   // O Asaas confirmou a cobrança; o nosso lado nunca soube.
   fake.payments.set("sub_1", [
-    { id: "pay_1", status: "CONFIRMED", dueDate: "2026-10-15", confirmedDate: "2026-10-15" },
+    { id: "pay_1", status: "CONFIRMED", dueDate: "2026-10-15", paymentDate: "2026-10-15" },
   ]);
   const fresh = (await getKeyRecordById(store, record.id))!;
   assert.equal(effectivePlan(fresh), "free", "a chave começa sem acesso pago");
@@ -533,7 +533,7 @@ test("falha ao consultar assinaturas não marca a assinatura como cancelada", as
 test("cobrança estornada não dá direito a acesso", async () => {
   const fake = fakeAsaas();
   const { asaas, record } = await lostEventState(fake);
-  fake.payments.set("sub_1", [{ id: "pay_1", status: "REFUNDED", dueDate: "2026-10-15", confirmedDate: "2026-10-15" }]);
+  fake.payments.set("sub_1", [{ id: "pay_1", status: "REFUNDED", dueDate: "2026-10-15", paymentDate: "2026-10-15" }]);
 
   const status = await getBillingStatus({ store, asaas }, record);
   assert.equal(status.plan, "free");
@@ -595,6 +595,78 @@ test("sem assinatura não há o que reconciliar", async () => {
   const status = await getBillingStatus({ store, asaas }, record);
   assert.equal(status.subscription, null);
   assert.equal(fake.calls.length, 0, "nem chega a falar com o Asaas");
+});
+
+test("assinatura EXPIRED ou INACTIVE não é adotada, apesar de não estar removida", async () => {
+  // O Asaas exclui as removidas da listagem por padrão, mas EXPIRED e INACTIVE voltam nela.
+  // Adotá-las daria ao cliente uma assinatura que não cobra mais nada.
+  for (const status of ["EXPIRED", "INACTIVE"]) {
+    store = createMemoryStore();
+    setStore(store);
+    const fake = fakeAsaas();
+    const asaas = client(fake);
+    const { record } = await newKey();
+    fake.subscriptions.set("sub_velha", { id: "sub_velha", ref: record.id, value: 49, status, deleted: false });
+
+    const result = await startCheckout({ store, asaas, now: NOW }, record, { plan: "pro", customer });
+    assert.notEqual(result.subscription_id, "sub_velha", `${status} não pode ser adotada`);
+    assert.equal(fake.callsTo("POST", "/subscriptions").length, 1, `${status} tem de levar a criar uma nova`);
+  }
+});
+
+test("cobrança recuperada por negativação dá direito ao acesso", async () => {
+  // DUNNING_RECEIVED é dinheiro recebido: chega atrasado, mas é pagamento.
+  const fake = fakeAsaas();
+  const asaas = client(fake);
+  const { record } = await newKey();
+  await startCheckout({ store, asaas, now: NOW }, record, { plan: "pro", customer });
+  fake.payments.set("sub_1", [
+    { id: "pay_1", status: "DUNNING_RECEIVED", dueDate: "2026-09-10", paymentDate: "2026-10-14" },
+  ]);
+
+  const status = await getBillingStatus({ store, asaas }, record);
+  assert.equal(status.plan, "pro");
+});
+
+test("o webhook também libera acesso com PAYMENT_DUNNING_RECEIVED", async () => {
+  const fake = fakeAsaas();
+  const asaas = client(fake);
+  const { record } = await newKey();
+  await startCheckout({ store, asaas, now: NOW }, record, { plan: "pro", customer });
+
+  const outcome = await handleAsaasEvent(store, paymentEvent("evt_d", "PAYMENT_DUNNING_RECEIVED"), NOW);
+  assert.equal(outcome, "processed");
+  assert.equal(effectivePlan((await getKeyRecordById(store, record.id))!, NOW.getTime()), "pro");
+});
+
+test("status de cobrança sem dinheiro recebido não dá acesso", async () => {
+  for (const status of ["PENDING", "OVERDUE", "REFUND_REQUESTED", "CHARGEBACK_REQUESTED", "AWAITING_RISK_ANALYSIS"]) {
+    store = createMemoryStore();
+    setStore(store);
+    const fake = fakeAsaas();
+    const asaas = client(fake);
+    const { record } = await newKey();
+    await startCheckout({ store, asaas, now: NOW }, record, { plan: "pro", customer });
+    fake.payments.set("sub_1", [{ id: "pay_1", status, dueDate: "2026-10-15", paymentDate: "2026-10-15" }]);
+
+    const result = await getBillingStatus({ store, asaas }, record);
+    assert.equal(result.plan, "free", `${status} não pode liberar acesso`);
+  }
+});
+
+test("usa paymentDate, e clientPaymentDate quando o primeiro não vem", async () => {
+  const fake = fakeAsaas();
+  const asaas = client(fake);
+  const { record } = await newKey();
+  await startCheckout({ store, asaas, now: NOW }, record, { plan: "pro", customer });
+  // Sem paymentDate: o Asaas pode trazer só a data em que o cliente quitou.
+  fake.payments.set("sub_1", [
+    { id: "pay_1", status: "RECEIVED", dueDate: "2026-10-15", clientPaymentDate: "2026-10-15" },
+  ]);
+
+  const status = await getBillingStatus({ store, asaas }, record);
+  assert.equal(status.plan, "pro");
+  assert.ok(status.plan_until);
 });
 
 // --- webhook: lógica -------------------------------------------------------

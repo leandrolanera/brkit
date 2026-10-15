@@ -46,11 +46,11 @@ curl -X POST https://SEU-DOMINIO/v1/billing/checkout \
   -d '{ "plan": "pro", "customer": { "name": "Maria Souza", "document": "529.982.247-25", "email": "maria@exemplo.com.br" } }'
 ```
 
-**Como o acesso é liberado.** Cada pagamento confirmado (`PAYMENT_CONFIRMED` ou `PAYMENT_RECEIVED`) estende o fim do período pago da chave em 31 dias + 3 de tolerância, a partir do que for mais tarde entre o vencimento e o momento do evento. Passada essa data a chave volta ao plano free sozinha, sem depender de evento de inadimplência nem da ordem em que os webhooks chegam (o Asaas entrega cada evento pelo menos uma vez e não garante ordem; aqui eventos repetidos não causam efeito duplicado).
+**Como o acesso é liberado.** Cada pagamento confirmado (`PAYMENT_CONFIRMED`, `PAYMENT_RECEIVED` ou `PAYMENT_DUNNING_RECEIVED`) estende o fim do período pago da chave em 31 dias + 3 de tolerância, a partir do que for mais tarde entre o vencimento e o momento do evento. Passada essa data a chave volta ao plano free sozinha, sem depender de evento de inadimplência nem da ordem em que os webhooks chegam (o Asaas entrega cada evento pelo menos uma vez e não garante ordem; aqui eventos repetidos não causam efeito duplicado).
 
 | Evento do Asaas | O que acontece |
 |---|---|
-| `PAYMENT_CONFIRMED`, `PAYMENT_RECEIVED` | Libera o plano e estende o período pago (Pix emite só `RECEIVED`; boleto e cartão emitem `CONFIRMED` e depois `RECEIVED`) |
+| `PAYMENT_CONFIRMED`, `PAYMENT_RECEIVED`, `PAYMENT_DUNNING_RECEIVED` | Libera o plano e estende o período pago (Pix emite só `RECEIVED`; boleto e cartão emitem `CONFIRMED` e depois `RECEIVED`; `DUNNING_RECEIVED` é a cobrança recuperada por negativação) |
 | `PAYMENT_REFUNDED`, `PAYMENT_CHARGEBACK_REQUESTED` | Revoga o acesso na hora |
 | `SUBSCRIPTION_DELETED`, `SUBSCRIPTION_INACTIVATED` | Marca a assinatura como cancelada; o acesso pago continua até o fim do período |
 | demais | Ignorados (respondem 200) |
@@ -74,7 +74,8 @@ O mesmo vale para o cliente, com consequência menor: cliente duplicado não cob
 - É idempotente: parte do estado das cobranças, não de eventos.
 - **Só estende, nunca encurta.** Cobrança estornada não entra na conta, mas as pagas e mantidas continuam valendo, então um estorno pontual não apaga o período que outras já cobriram.
 - Também sincroniza a assinatura: removida no painel do Asaas sem o evento chegar, ela ficaria presa em `active` e impediria contratar de novo. Se a consulta falhar, nada é marcado — cancelar por engano liberaria um segundo checkout.
-- O evento traz `dateCreated` com hora, mas a cobrança traz só a data da confirmação. Essa data é lida como o **fim** do dia, para que um evento perdido nunca custe acesso: a falha foi nossa.
+- O evento traz `dateCreated` com hora, mas o objeto da cobrança só tem datas sem hora (`paymentDate`, e `clientPaymentDate` como alternativa). Essa data é lida como o **fim** do dia, para que um evento perdido nunca custe acesso: a falha foi nossa.
+- Dinheiro recebido por negativação conta: `PAYMENT_DUNNING_RECEIVED` libera o acesso, e o status `DUNNING_RECEIVED` entra na reconciliação. Chega atrasado, mas é pagamento.
 
 ### Configuração
 
@@ -96,7 +97,7 @@ Atenção: o Asaas pode pausar a fila do webhook depois de 15 falhas seguidas. O
 - O documento do cliente (CPF/CNPJ) vai direto ao Asaas e não é guardado aqui; só o id do cliente e da assinatura ficam no Redis.
 - Criar a chave free ainda é manual (`npm run create-key`). Falta um cadastro público com verificação de e-mail.
 - Não verificado ainda contra o Asaas real: se o link da fatura da primeira cobrança já está disponível logo após criar a assinatura (se não estiver, `payment_url` vem nulo e `GET /v1/billing` devolve o link em `pending_payment_url`), se o cadastro de cliente aceita CNPJ alfanumérico e se há restrições para o domínio de `BILLING_SUCCESS_URL`.
-- Também não verificado: se `GET /subscriptions?externalReference=` devolve as assinaturas já removidas. Assumimos que **sim** e descartamos as que vêm com `deleted: true` ou status diferente de `ACTIVE` — se o Asaas já as excluir, o filtro é redundância inofensiva; se não, ele é o que impede uma assinatura cancelada de ser readotada.
+- O que **já foi conferido na documentação** (não no sandbox): o header `asaas-access-token` e a pausa da fila após 15 falhas; o formato de `dateCreated` (`AAAA-MM-DD HH:MM:SS`) e de `dueDate`; `payment.subscription` vindo só quando a cobrança pertence a uma assinatura; os filtros `externalReference` em `/subscriptions` e `/customers`; `limit` máximo de 100; os status de assinatura (`ACTIVE`, `EXPIRED`, `INACTIVE`) e de cobrança; e que `GET /subscriptions` **exclui as removidas por padrão** (`includeDeleted`/`deletedOnly` para o contrário). Como `EXPIRED` e `INACTIVE` não são removidas e voltam na listagem, é o filtro por `status === "ACTIVE"` que impede adotar uma assinatura que já não cobra nada.
 
 ## Outros limites conhecidos
 
