@@ -29,6 +29,7 @@ Plataforma comum (chave de API, limite por minuto, cota mensal, medição e cobr
 | `POST /v1/keys/recover` `{ "email": "..." }` | Perdeu a chave: envia código para substituí-la (pública) |
 | `POST /v1/keys/recover/verify` `{ "email", "code" }` | Confere o código e devolve a chave nova (pública) |
 | `GET /v1/health` | Verificação de saúde (pública) |
+| `GET /v1/openapi.json` | Especificação OpenAPI 3.1 desta instalação (pública) |
 
 Autenticação: header `x-api-key: ak_live_...` ou `Authorization: Bearer ak_live_...`.
 Toda resposta autenticada traz `x-ratelimit-*` e `x-usage-*`. Erros seguem o formato `{ "error": { "code", "message" } }`.
@@ -64,6 +65,19 @@ Decisões que valem saber:
 - **Uma chave por e-mail.** O código vale 30 minutos e aceita 5 tentativas; esgotadas, ele é invalidado e é preciso pedir outro. O contador usa `incr`, atômico, então chamadas simultâneas não furam o limite.
 - **Limites da rota pública:** 5 pedidos por minuto por IP e 2 por minuto por e-mail (para o cadastro não servir de ferramenta para inundar a caixa de alguém); 10 verificações por minuto por IP.
 - Envio pelo **Resend** (`POST /emails`, sem SDK). Sem `RESEND_API_KEY` e `EMAIL_FROM`, as duas rotas respondem 503 — inclusive a de verificação, porque devolver "código inválido" a quem nunca pôde receber um código seria enganoso.
+
+## Documentação OpenAPI
+
+`GET /v1/openapi.json` devolve a especificação OpenAPI 3.1 de todos os endpoints. Pública de propósito: a documentação precisa ser legível por quem ainda não tem chave.
+
+Para ler num navegador, aponte um renderizador para essa URL — [Scalar](https://github.com/scalar/scalar), [Redoc](https://github.com/Redocly/redoc) ou o Swagger Editor servem. O documento vai com `access-control-allow-origin: *` justamente para isso. Nenhuma página HTML foi adicionada aqui: isso traria um script de CDN para dentro do projeto, e a decisão de fazer ou não isso fica para a landing page.
+
+O spec é **construído em TypeScript** (`lib/openapi.ts`), não escrito como JSON estático, porque documentação de API erra por desatualizar e um arquivo solto não tem como avisar. Daí:
+
+- Os limites documentados saem das mesmas constantes que o código aplica (`PLANS`, `LIMITS` do Pix). Mudar a cota muda a documentação.
+- Os testes conferem cobertura **nos dois sentidos**: toda rota exportada em `api/` precisa estar no spec, e todo caminho do spec precisa existir como rota. Endpoint novo sem documentação quebra a suíte, e documentação de rota removida também.
+- O webhook do Asaas é excluído de propósito (quem chama é o provedor, não clientes). A exclusão é uma lista explícita e testada: se a rota deixar de existir, o teste avisa que o motivo registrado ficou obsoleto.
+- Outras conferências: todo `$ref` resolve, nenhum schema fica órfão, `operationId` é único, rota pública declara `security: []` (sem isso a doc pediria chave de quem está tentando obtê-la), e endpoint que consome cota documenta o 402 — e quem não consome, não documenta.
 
 ## Rotação e recuperação de chave
 
@@ -224,6 +238,7 @@ api/            endpoints (um arquivo por rota, handlers no padrão Web Request/
   redirect.ts         rota pública do QR dinâmico
 lib/
   withApi.ts    autenticação, limite, cota e medição
+  openapi.ts    especificação OpenAPI 3.1, derivada das constantes do código
   rateLimit.ts  contador de janela por minuto (usado pelo withApi e pelo /r/:id)
   auth.ts       chaves (somente hash armazenado), plano em vigor e rotação do segredo
   billing.ts    checkout, cancelamento e processamento dos eventos do Asaas
@@ -259,7 +274,7 @@ Lista mantida em ordem de prioridade. O que está em "verificação externa" nã
 
 ### Produto
 
-4. **Documentação OpenAPI e landing page.**
+4. **Landing page**, com um renderizador do `/v1/openapi.json` embutido. Decidir aí se vale trazer um script de CDN para o projeto.
 5. **Revisar planos e preços** em `lib/plans.ts`, hoje provisórios, depois de medir custo real.
 
 ### Técnico
