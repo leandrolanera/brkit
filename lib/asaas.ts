@@ -103,6 +103,17 @@ export function createAsaasClient(config: AsaasConfig) {
       return request<{ id: string; status?: string; paymentLink?: string | null }>("POST", "/subscriptions", input);
     },
 
+    /**
+     * Altera uma assinatura. `updatePendingPayments` aplica a mudança também às cobranças já
+     * geradas e não pagas; sem ele (padrão do Asaas) o valor novo só vale para as futuras.
+     */
+    updateSubscription(
+      id: string,
+      input: { value?: number; description?: string; updatePendingPayments?: boolean },
+    ) {
+      return request<AsaasSubscription>("PUT", `/subscriptions/${encodeURIComponent(id)}`, input);
+    },
+
     deleteSubscription(id: string) {
       return request<unknown>("DELETE", `/subscriptions/${encodeURIComponent(id)}`);
     },

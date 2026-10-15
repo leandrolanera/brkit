@@ -1,7 +1,7 @@
 import { AsaasError, type AsaasClient } from "./asaas.js";
 import { effectivePlan, getKeyRecordById, updateKeyPlan, type KeyRecord } from "./auth.js";
 import { apiError } from "./http.js";
-import { BILLING_CYCLE_DAYS, GRACE_DAYS, PLANS, type PaidPlanId } from "./plans.js";
+import { BILLING_CYCLE_DAYS, GRACE_DAYS, PLANS, type PaidPlanId, type PlanId } from "./plans.js";
 import type { Store } from "./store.js";
 
 /**
@@ -381,6 +381,95 @@ export async function getBillingStatus(deps: { store: Store; asaas: AsaasClient 
     subscription: record ? { id: record.subscriptionId, plan: record.plan, status: record.status } : null,
     pending_payment_url: pendingPaymentUrl,
     usage: { month, used, limit: PLANS[plan].monthlyQuota },
+  };
+}
+
+export interface ChangePlanResult {
+  /** false quando a chave já estava no plano pedido. */
+  changed: boolean;
+  /** Plano contratado depois da mudança. */
+  plan: PaidPlanId;
+  /** Plano em vigor neste momento. Difere de `plan` no downgrade. */
+  effective_plan: PlanId;
+  price_brl: number;
+  /**
+   * Quando o plano novo passou a valer. `null` significa "no próximo pagamento confirmado":
+   * é o caso do downgrade e do upgrade de quem ainda não tem período pago.
+   */
+  effective_from: string | null;
+}
+
+/**
+ * Troca o plano de uma assinatura ativa, sem cancelar e contratar de novo.
+ *
+ * O Asaas não faz cobrança proporcional, então não há como acertar a diferença no meio do
+ * ciclo. A política escolhida, que dispensa proporcional e sempre favorece o cliente:
+ *
+ * - **Upgrade vale na hora.** Quem sobe de plano normalmente acabou de bater na cota; esperar o
+ *   ciclo virar anularia o motivo da troca. O custo é a diferença de cota pelo resto do período
+ *   já pago, barata nestes endpoints. Se ainda não há período pago, não há o que antecipar: vale
+ *   quando o pagamento for confirmado.
+ * - **Downgrade vale no próximo pagamento.** O período em curso foi pago no plano maior e o
+ *   Asaas não devolve a diferença, então tirar o acesso agora seria retomar algo já pago.
+ *
+ * O valor novo é aplicado também às cobranças já geradas e não pagas
+ * (`updatePendingPayments`): quem trocou antes de pagar paga o preço novo deste ciclo.
+ */
+export async function changePlan(
+  deps: { store: Store; asaas: AsaasClient; now?: Date },
+  key: KeyRecord,
+  plan: PaidPlanId,
+): Promise<ChangePlanResult> {
+  const { store, asaas } = deps;
+  const now = deps.now ?? new Date();
+
+  const record = await store.get<BillingRecord>(keyBillingKey(key.id));
+  if (!record || record.status !== "active") {
+    throw new BillingError(
+      404,
+      "no_active_subscription",
+      "Não há assinatura ativa para esta chave. Use POST /v1/billing/checkout para contratar.",
+    );
+  }
+
+  const price = PLANS[plan].priceBRL;
+
+  // Responde com sucesso em vez de erro: uma repetição por timeout não deve parecer falha
+  // quando o estado já é o pedido.
+  if (plan === record.plan) {
+    return {
+      changed: false,
+      plan,
+      effective_plan: effectivePlan(key, now.getTime()),
+      price_brl: price,
+      effective_from: null,
+    };
+  }
+
+  const upgrade = price > PLANS[record.plan].priceBRL;
+
+  await asaas.updateSubscription(record.subscriptionId, {
+    value: price,
+    description: `API Portfolio - plano ${plan}`,
+    updatePendingPayments: true,
+  });
+
+  // O índice é o que grantAccess consulta, então mudá-lo faz o próximo pagamento confirmado
+  // aplicar o plano novo — sem precisar de mecanismo de "plano pendente".
+  await recordSubscription(store, key.id, record.subscriptionId, plan, now);
+
+  // Só antecipa quando já existe período pago para estender. Sem isso, um upgrade feito antes
+  // do primeiro pagamento gravaria o plano sem vencimento, ou seja, de graça para sempre.
+  const anticipate = upgrade && effectivePlan(key, now.getTime()) !== "free" && Boolean(key.planUntil);
+  if (anticipate) await updateKeyPlan(store, key.id, { plan, planUntil: key.planUntil });
+
+  const updated = (await getKeyRecordById(store, key.id)) ?? key;
+  return {
+    changed: true,
+    plan,
+    effective_plan: effectivePlan(updated, now.getTime()),
+    price_brl: price,
+    effective_from: anticipate ? now.toISOString() : null,
   };
 }
 

@@ -5,6 +5,7 @@ import { createApiKey, effectivePlan, getKeyRecordById, updateKeyPlan, type KeyR
 import {
   BillingError,
   cancelSubscription,
+  changePlan,
   getBillingStatus,
   handleAsaasEvent,
   reconcileSubscription,
@@ -15,7 +16,7 @@ import {
 import { createMemoryStore, setStore, type Store } from "../lib/store.js";
 import { POST as webhook } from "../api/webhooks/asaas.js";
 import { POST as checkout } from "../api/v1/billing/checkout.js";
-import { DELETE as cancelEndpoint, GET as statusEndpoint } from "../api/v1/billing/index.js";
+import { DELETE as cancelEndpoint, GET as statusEndpoint, PUT as statusPut } from "../api/v1/billing/index.js";
 import { call, jsonBody, withEnv } from "./helpers.js";
 
 interface FakeCall {
@@ -56,7 +57,7 @@ function fakeAsaas(
   const customers = new Map<string, { id: string; ref: string; deleted: boolean }>();
   const subscriptions = new Map<string, { id: string; ref: string; value: number; status: string; deleted: boolean }>();
   /** Cobranças por assinatura. Cada assinatura nasce com uma PENDING, como no Asaas. */
-  const payments = new Map<string, AsaasPayment[]>();
+  const payments = new Map<string, (AsaasPayment & { value?: number })[]>();
 
   const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
     const raw = String(input);
@@ -126,6 +127,19 @@ function fakeAsaas(
     }
 
     const one = path.match(/^\/subscriptions\/([^/]+)$/);
+    if (method === "PUT" && one) {
+      const sub = subscriptions.get(one[1]!);
+      if (!sub) return respond(404, { errors: [{ code: "not_found", description: "assinatura inexistente" }] });
+      if (typeof body?.["value"] === "number") sub.value = body["value"];
+      // Fiel ao Asaas: sem updatePendingPayments, a cobrança já gerada não muda de valor.
+      if (body?.["updatePendingPayments"] === true) {
+        for (const pay of payments.get(sub.id) ?? []) {
+          if (pay.status === "PENDING") pay.value = sub.value;
+        }
+      }
+      return respond(200, { id: sub.id, status: sub.status, value: sub.value, deleted: sub.deleted });
+    }
+
     if (method === "DELETE" && one) {
       const sub = subscriptions.get(one[1]!);
       if (!sub) return respond(404, { errors: [{ code: "not_found", description: "assinatura inexistente" }] });
@@ -276,6 +290,193 @@ test("segundo checkout com assinatura ativa → 409; após cancelar, contrata de
 
   await startCheckout({ store, asaas, now: NOW }, record, { plan: "scale", customer });
   assert.equal(fake.callsTo("POST", "/customers").length, 1, "o cliente do Asaas é reaproveitado");
+});
+
+// --- troca de plano --------------------------------------------------------
+//
+// O Asaas não faz cobrança proporcional, então não há como acertar a diferença no meio do
+// ciclo. Política: upgrade vale na hora (quem sobe acabou de bater na cota), downgrade vale no
+// próximo pagamento (o período em curso foi pago no plano maior e não há devolução).
+
+/** Chave com assinatura ativa e período pago em vigor no plano informado. */
+async function assinante(fake: ReturnType<typeof fakeAsaas>, plan: "pro" | "scale") {
+  const asaas = client(fake);
+  const { key, record } = await newKey();
+  await startCheckout({ store, asaas, now: NOW }, record, { plan, customer });
+  const until = new Date(NOW.getTime() + 20 * 86_400_000).toISOString();
+  await updateKeyPlan(store, record.id, { plan, planUntil: until });
+  return { asaas, key, record: (await getKeyRecordById(store, record.id))!, until };
+}
+
+test("upgrade vale na hora, mantendo o vencimento já pago", async () => {
+  const fake = fakeAsaas();
+  const { asaas, record, until } = await assinante(fake, "pro");
+
+  const result = await changePlan({ store, asaas, now: NOW }, record, "scale");
+
+  assert.equal(result.changed, true);
+  assert.equal(result.plan, "scale");
+  assert.equal(result.effective_plan, "scale", "o upgrade precisa valer imediatamente");
+  assert.equal(result.price_brl, 249);
+  assert.equal(result.effective_from, NOW.toISOString());
+
+  const depois = (await getKeyRecordById(store, record.id))!;
+  assert.equal(depois.plan, "scale");
+  assert.equal(depois.planUntil, until, "o período pago não muda");
+  assert.equal(fake.subscriptions.get("sub_1")?.value, 249, "o Asaas passa a cobrar o valor novo");
+});
+
+test("depois do upgrade a cota maior já vale nas chamadas", async () => {
+  const fake = fakeAsaas();
+  const { asaas, key, record } = await assinante(fake, "pro");
+  await changePlan({ store, asaas, now: NOW }, record, "scale");
+
+  const res = await call(statusEndpoint, "/v1/billing", key);
+  assert.equal(res.headers.get("x-usage-limit"), "500000", "o limite acompanha o plano em vigor");
+});
+
+test("downgrade não tira o acesso já pago: vale no próximo pagamento", async () => {
+  const fake = fakeAsaas();
+  const { asaas, record, until } = await assinante(fake, "scale");
+
+  const result = await changePlan({ store, asaas, now: NOW }, record, "pro");
+
+  assert.equal(result.changed, true);
+  assert.equal(result.plan, "pro", "o contratado já é o novo");
+  assert.equal(result.effective_plan, "scale", "mas o que vale agora é o que foi pago");
+  assert.equal(result.effective_from, null, "vale no próximo pagamento confirmado");
+
+  const depois = (await getKeyRecordById(store, record.id))!;
+  assert.equal(depois.plan, "scale");
+  assert.equal(depois.planUntil, until);
+  assert.equal(fake.subscriptions.get("sub_1")?.value, 49);
+});
+
+test("o pagamento seguinte ao downgrade aplica o plano novo", async () => {
+  const fake = fakeAsaas();
+  const { asaas, record } = await assinante(fake, "scale");
+  await changePlan({ store, asaas, now: NOW }, record, "pro");
+
+  await handleAsaasEvent(store, paymentEvent("evt_dg", "PAYMENT_CONFIRMED"), NOW);
+
+  const depois = (await getKeyRecordById(store, record.id))!;
+  assert.equal(depois.plan, "pro", "o índice da assinatura é o que grantAccess consulta");
+});
+
+test("upgrade sem período pago não concede plano sem vencimento", async () => {
+  // O caso perigoso: updateKeyPlan sem planUntil apaga o vencimento, o que daria o plano
+  // de graça para sempre. Antecipar só faz sentido havendo período pago para estender.
+  const fake = fakeAsaas();
+  const asaas = client(fake);
+  const { record } = await newKey();
+  await startCheckout({ store, asaas, now: NOW }, record, { plan: "pro", customer });
+
+  const result = await changePlan({ store, asaas, now: NOW }, record, "scale");
+
+  assert.equal(result.effective_plan, "free");
+  assert.equal(result.effective_from, null);
+  const depois = (await getKeyRecordById(store, record.id))!;
+  assert.equal(depois.planUntil, undefined, "não pode virar plano pago sem vencimento");
+  assert.equal(effectivePlan(depois, NOW.getTime()), "free");
+});
+
+test("upgrade com período pago vencido também não antecipa", async () => {
+  const fake = fakeAsaas();
+  const asaas = client(fake);
+  const { record } = await newKey();
+  await startCheckout({ store, asaas, now: NOW }, record, { plan: "pro", customer });
+  await updateKeyPlan(store, record.id, {
+    plan: "pro",
+    planUntil: new Date(NOW.getTime() - 86_400_000).toISOString(),
+  });
+  const vencida = (await getKeyRecordById(store, record.id))!;
+
+  const result = await changePlan({ store, asaas, now: NOW }, vencida, "scale");
+  assert.equal(result.effective_plan, "free", "não há acesso vigente para estender");
+  assert.equal(result.effective_from, null);
+});
+
+test("a cobrança já gerada e não paga passa a valer o preço novo", async () => {
+  const fake = fakeAsaas();
+  const { asaas, record } = await assinante(fake, "pro");
+
+  await changePlan({ store, asaas, now: NOW }, record, "scale");
+
+  const enviado = fake.callsTo("PUT", "/subscriptions/sub_1")[0];
+  assert.equal(enviado?.body?.["updatePendingPayments"], true);
+  assert.equal(enviado?.body?.["value"], 249);
+  assert.match(String(enviado?.body?.["description"]), /scale/);
+  assert.equal(fake.payments.get("sub_1")?.[0]?.value, 249, "quem trocou antes de pagar paga o novo");
+});
+
+test("pedir o plano em que já está responde sucesso sem mexer no Asaas", async () => {
+  const fake = fakeAsaas();
+  const { asaas, record } = await assinante(fake, "pro");
+
+  const result = await changePlan({ store, asaas, now: NOW }, record, "pro");
+
+  assert.equal(result.changed, false);
+  assert.equal(result.plan, "pro");
+  assert.equal(fake.callsTo("PUT", "/subscriptions/sub_1").length, 0, "repetir por timeout não é erro");
+});
+
+test("sem assinatura ativa a troca é 404, apontando o checkout", async () => {
+  const fake = fakeAsaas();
+  const asaas = client(fake);
+  const { record } = await newKey();
+
+  await assert.rejects(
+    () => changePlan({ store, asaas, now: NOW }, record, "scale"),
+    (err: unknown) => err instanceof BillingError && err.status === 404 && /checkout/.test(err.message),
+  );
+});
+
+test("assinatura cancelada não aceita troca de plano", async () => {
+  const fake = fakeAsaas();
+  const { asaas, record } = await assinante(fake, "pro");
+  await cancelSubscription({ store, asaas }, record);
+
+  await assert.rejects(
+    () => changePlan({ store, asaas, now: NOW }, record, "scale"),
+    (err: unknown) => err instanceof BillingError && err.status === 404,
+  );
+});
+
+test("PUT /v1/billing troca o plano e valida a entrada", async () => {
+  restoreEnv = withEnv({ ASAAS_API_KEY: "chave-teste" });
+  const fake = fakeAsaas();
+  globalThis.fetch = fake.fetchImpl;
+  const { key, record } = await newKey();
+  const asaas = client(fake);
+  await startCheckout({ store, asaas, now: NOW }, record, { plan: "pro", customer });
+
+  const put = (body: unknown) =>
+    call(statusPut, "/v1/billing", key, { ...jsonBody(body), method: "PUT" });
+
+  assert.equal((await put({ plan: "free" })).status, 400);
+  assert.equal((await put({ plan: "nope" })).status, 400);
+  assert.equal((await put({})).status, 400);
+
+  const ok = await put({ plan: "scale" });
+  assert.equal(ok.status, 200);
+  assert.equal(((await ok.json()) as { plan: string }).plan, "scale");
+
+  assert.equal((await call(statusPut, "/v1/billing", undefined, { ...jsonBody({ plan: "pro" }), method: "PUT" })).status, 401);
+});
+
+test("a troca de plano não consome cota e funciona com a cota esgotada", async () => {
+  restoreEnv = withEnv({ ASAAS_API_KEY: "chave-teste" });
+  const fake = fakeAsaas();
+  globalThis.fetch = fake.fetchImpl;
+  const { key, record } = await newKey();
+  const asaas = client(fake);
+  await startCheckout({ store, asaas, now: NOW }, record, { plan: "pro", customer });
+  const month = new Date().toISOString().slice(0, 7);
+  await store.set(`usage:${record.id}:${month}`, 1000);
+
+  const res = await call(statusPut, "/v1/billing", key, { ...jsonBody({ plan: "scale" }), method: "PUT" });
+  assert.equal(res.status, 200, "trocar de plano precisa funcionar justamente quando a cota acabou");
+  assert.equal(await store.get(`usage:${record.id}:${month}`), 1000);
 });
 
 // --- recuperação antes de criar --------------------------------------------

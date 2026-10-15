@@ -20,6 +20,7 @@ Plataforma comum (chave de API, limite por minuto, cota mensal, medição e cobr
 | `GET /v1/holidays/business-days?from=2026-10-01&to=2026-10-31` | Dias úteis (sem fins de semana e feriados nacionais) |
 | `POST /v1/billing/checkout` | Contrata um plano (assinatura mensal no Asaas) e devolve o link da fatura |
 | `GET /v1/billing` | Plano em vigor, vencimento, assinatura, uso do mês e link pendente |
+| `PUT /v1/billing` `{ "plan": "scale" }` | Troca o plano sem cancelar (upgrade vale na hora; downgrade, no próximo pagamento) |
 | `DELETE /v1/billing` | Cancela a assinatura (o acesso pago segue até o fim do período já pago) |
 | `POST /api/webhooks/asaas` | Webhook do Asaas (autenticado por token) |
 | `GET /v1/health` | Verificação de saúde (pública) |
@@ -66,6 +67,14 @@ Por isso o checkout **procura antes de criar**, filtrando as assinaturas pelo `e
 
 O mesmo vale para o cliente, com consequência menor: cliente duplicado não cobra ninguém, então ali a falha na consulta não interrompe o checkout.
 
+**Troca de plano.** `PUT /v1/billing` altera o plano da assinatura ativa, sem cancelar e contratar de novo. O Asaas **não faz cobrança proporcional**, então não há como acertar a diferença no meio do ciclo. A política escolhida dispensa proporcional e sempre favorece o cliente:
+
+- **Upgrade vale na hora.** Quem sobe de plano normalmente acabou de bater na cota; esperar o ciclo virar anularia o motivo da troca. O custo é a diferença de cota pelo resto do período já pago. Se ainda não há período pago em vigor, não há o que antecipar: o plano passa a valer quando o pagamento for confirmado.
+- **Downgrade vale no próximo pagamento confirmado.** O período em curso foi pago no plano maior e o Asaas não devolve a diferença, então tirar o acesso agora seria retomar algo já pago.
+- O valor novo é aplicado também às cobranças já geradas e não pagas (`updatePendingPayments: true`): quem troca antes de pagar paga o preço novo já neste ciclo.
+- Pedir o plano em que a chave já está responde 200 com `changed: false`, para que uma repetição por timeout não pareça falha.
+- Depois de um downgrade em vigor, a cota pode ficar abaixo do que já foi consumido no mês. Nesse caso as chamadas respondem 402 até a virada do mês.
+
 **Reconciliação (quando o webhook falha).** O webhook é o único caminho que libera acesso, e ele falha de formas que ninguém percebe: o Asaas pausa a fila depois de 15 falhas seguidas, um deploy com erro perde eventos. O resultado seria o cliente sem o acesso que pagou.
 
 `GET /v1/billing` reconstrói o direito a partir das cobranças que o Asaas realmente tem, sem depender de evento nenhum. Isso roda **só quando o estado é suspeito** — assinatura ativa e sem acesso pago vigente, que é exatamente o sintoma de um evento perdido (e também o estado normal de quem ainda não pagou). No caminho saudável não há chamada extra.
@@ -92,7 +101,7 @@ Atenção: o Asaas pode pausar a fila do webhook depois de 15 falhas seguidas. O
 
 ### Limites conhecidos
 
-- Trocar de plano exige cancelar e contratar de novo; não há proração.
+- Não há cobrança proporcional na troca de plano, porque o Asaas não oferece. Ver a política de troca acima.
 - Quem cancela mantém o acesso até o fim do período pago e não recebe reembolso automático.
 - O documento do cliente (CPF/CNPJ) vai direto ao Asaas e não é guardado aqui; só o id do cliente e da assinatura ficam no Redis.
 - Criar a chave free ainda é manual (`npm run create-key`). Falta um cadastro público com verificação de e-mail.
@@ -172,11 +181,30 @@ scripts/create-key.ts
 test/
 ```
 
-## Próximos passos sugeridos
+## Pendências
 
-1. Rodar `npm install`, `npm run typecheck` e `npm test`.
-2. Deploy no sandbox do Asaas e um pagamento de teste de ponta a ponta.
-3. Cadastro público de chaves com verificação de e-mail.
-4. Documentação OpenAPI e landing page.
-5. HTML → PDF e Screenshot (navegador headless: avaliar a Vercel com Chromium compacto, ou uma VPS pequena).
-6. Créditos pré-pagos, necessários antes dos endpoints com IA.
+Lista mantida em ordem de prioridade. O que está em "verificação externa" não é resolvível escrevendo código: depende de credencial, deploy ou de um aparelho real.
+
+### Verificação externa (bloqueia confiança no que já está feito)
+
+1. **Pagamento de teste de ponta a ponta no sandbox do Asaas.** É a maior dívida do projeto. Toda a cobrança está verificada contra um Asaas simulado neste repositório, com os campos conferidos na documentação — nunca contra o serviço real. Nessa rodada, confirmar também:
+   - se o link da fatura da primeira cobrança já existe logo após criar a assinatura (se não, `payment_url` vem nulo e o link aparece em `pending_payment_url`);
+   - se o cadastro de cliente aceita CNPJ alfanumérico;
+   - se há restrição de domínio para `BILLING_SUCCESS_URL`;
+   - se `DUNNING_RECEIVED` significa de fato dinheiro creditado (foi inferido da descrição "payment received");
+   - se `PUT /subscriptions` com `updatePendingPayments: true` realmente altera o valor da cobrança pendente.
+2. **Ler um QR Pix gerado aqui num app de banco de verdade.** O formato está conferido contra a especificação do BACEN e o CRC contra dois vetores independentes, mas nenhum QR foi escaneado. Usar valor baixo.
+3. **Conferir um boleto real.** Os algoritmos batem com os exemplos resolvidos da FEBRABAN e com um par código de barras/linha digitável de terceiro; falta passar uma linha digitável de boleto recebido de verdade.
+
+### Produto
+
+4. **Cadastro público de chaves com verificação de e-mail.** Hoje criar chave free é manual (`npm run create-key`), o que impede self-service. Precisa de provedor de e-mail — primeira dependência externa nova do projeto.
+5. **Documentação OpenAPI e landing page.**
+6. **Revisar planos e preços** em `lib/plans.ts`, hoje provisórios, depois de medir custo real.
+
+### Técnico
+
+7. **Reconciliação ativa**, por rotina agendada, em vez de só no `GET /v1/billing`. Hoje a autocura depende de o cliente consultar o status.
+8. **Paginação nas consultas ao Asaas.** O limite de 100 por página cobre mais de 8 anos de assinatura mensal, mas não é infinito.
+9. **HTML → PDF e screenshot.** Precisa de Chromium headless: avaliar a Vercel com build compacto ou uma VPS pequena. É projeto, não tarefa.
+10. **Créditos pré-pagos**, necessários antes de qualquer endpoint com IA. O gancho já existe em `withApi(handler, { cost: N })`.
