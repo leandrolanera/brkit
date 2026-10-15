@@ -85,6 +85,10 @@ function spyStore(inner: Store): { store: Store; calls: string[] } {
       calls.push(`expire ${key} ${seconds}`);
       return inner.expire(key, seconds);
     },
+    async del(key) {
+      calls.push(`del ${key}`);
+      return inner.del(key);
+    },
   };
   return { store, calls };
 }

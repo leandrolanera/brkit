@@ -84,6 +84,11 @@ class FakeRedis {
     entry.expiresAt = this.now + seconds * 1000;
     return 1;
   }
+
+  async del(key: string) {
+    this.calls.push(`del ${key}`);
+    return this.data.delete(key) ? 1 : 0;
+  }
 }
 
 function redisStoreWithFake(): { store: Store; fake: FakeRedis } {
@@ -138,6 +143,24 @@ for (const [name, make] of implementations) {
       const store = make();
       assert.equal(await store.incrBy("c", 5), 5);
       assert.equal(await store.incrBy("c", 3), 8);
+    });
+
+    test("del apaga a chave", async () => {
+      const store = make();
+      await store.set("k", "v");
+      await store.del("k");
+      assert.equal(await store.get("k"), null);
+    });
+
+    test("del de chave ausente não quebra", async () => {
+      await make().del("nao-existe");
+    });
+
+    test("depois de del, nx volta a aceitar a gravação", async () => {
+      const store = make();
+      await store.set("k", "v", { nx: true });
+      await store.del("k");
+      assert.equal(await store.set("k", "outro", { nx: true }), true);
     });
   });
 }
@@ -213,6 +236,13 @@ describe("RedisStore: delegação dos comandos", () => {
     await store.expire("k", 90);
     assert.ok(fake.calls.includes("expire k"));
     assert.equal(fake.ttl("k"), 90);
+  });
+
+  test("del usa o comando del do cliente", async () => {
+    const { store, fake } = redisStoreWithFake();
+    await store.set("k", "v");
+    await store.del("k");
+    assert.ok(fake.calls.includes("del k"));
   });
 
   test("get devolve null quando a chave expirou", async () => {

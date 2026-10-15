@@ -23,6 +23,8 @@ Plataforma comum (chave de API, limite por minuto, cota mensal, medição e cobr
 | `PUT /v1/billing` `{ "plan": "scale" }` | Troca o plano sem cancelar (upgrade vale na hora; downgrade, no próximo pagamento) |
 | `DELETE /v1/billing` | Cancela a assinatura (o acesso pago segue até o fim do período já pago) |
 | `POST /api/webhooks/asaas` | Webhook do Asaas (autenticado por token) |
+| `POST /v1/signup` `{ "email": "..." }` | Pede uma chave free: envia código de verificação (pública) |
+| `POST /v1/signup/verify` `{ "email", "code" }` | Confere o código e devolve a chave, uma única vez (pública) |
 | `GET /v1/health` | Verificação de saúde (pública) |
 
 Autenticação: header `x-api-key: ak_live_...` ou `Authorization: Bearer ak_live_...`.
@@ -36,6 +38,29 @@ Toda resposta autenticada traz `x-ratelimit-*` e `x-usage-*`. Erros seguem o for
 - `withApi(handler, { cost: N })` cobra N unidades por chamada, o gancho para os endpoints com IA quando entrarem os créditos pré-pagos.
 - `withApi(handler, { cost: 0 })` não consome nem exige cota. É o caso dos endpoints de cobrança, que precisam funcionar justamente quando a cota acabou.
 - Os planos e preços em `lib/plans.ts` são provisórios (free 1.000 chamadas, pro R$ 49 com 50.000, scale R$ 249 com 500.000 por mês).
+
+## Cadastro público de chaves
+
+Qualquer pessoa obtém uma chave free verificando um e-mail. A verificação existe para dar algum custo à obtenção da chave: sem ela, criar chaves em massa seria trivial.
+
+```bash
+curl -X POST https://SEU-DOMINIO/v1/signup \
+  -H "content-type: application/json" -d '{ "email": "voce@exemplo.com.br" }'
+# chega um código de 8 caracteres por e-mail
+
+curl -X POST https://SEU-DOMINIO/v1/signup/verify \
+  -H "content-type: application/json" -d '{ "email": "voce@exemplo.com.br", "code": "ABCD2345" }'
+# { "api_key": "ak_live_...", ... }  <- aparece só aqui
+```
+
+Decisões que valem saber:
+
+- **Código por e-mail, confirmado via POST** — e não link clicável. Um token em query string iria para log de acesso, o que contraria a mesma regra que faz o CPF só ser aceito por POST neste projeto. Também dispensa qualquer página HTML.
+- **A resposta de `/v1/signup` é 202 em todo e-mail válido**, exista chave para ele ou não. Dizer a diferença daria um jeito de descobrir quem está cadastrado; quem já tem chave recebe um e-mail explicando, em vez de um código.
+- **O e-mail não é gravado em claro.** As chaves do Redis usam o hash dele, e do código guardamos só o hash — como já era feito com as chaves de API.
+- **Uma chave por e-mail.** O código vale 30 minutos e aceita 5 tentativas; esgotadas, ele é invalidado e é preciso pedir outro. O contador usa `incr`, atômico, então chamadas simultâneas não furam o limite.
+- **Limites da rota pública:** 5 pedidos por minuto por IP e 2 por minuto por e-mail (para o cadastro não servir de ferramenta para inundar a caixa de alguém); 10 verificações por minuto por IP.
+- Envio pelo **Resend** (`POST /emails`, sem SDK). Sem `RESEND_API_KEY` e `EMAIL_FROM`, as duas rotas respondem 503 — inclusive a de verificação, porque devolver "código inválido" a quem nunca pôde receber um código seria enganoso.
 
 ## Cobrança com Asaas
 
@@ -104,11 +129,14 @@ Atenção: o Asaas pode pausar a fila do webhook depois de 15 falhas seguidas. O
 - Não há cobrança proporcional na troca de plano, porque o Asaas não oferece. Ver a política de troca acima.
 - Quem cancela mantém o acesso até o fim do período pago e não recebe reembolso automático.
 - O documento do cliente (CPF/CNPJ) vai direto ao Asaas e não é guardado aqui; só o id do cliente e da assinatura ficam no Redis.
-- Criar a chave free ainda é manual (`npm run create-key`). Falta um cadastro público com verificação de e-mail.
 - Não verificado ainda contra o Asaas real: se o link da fatura da primeira cobrança já está disponível logo após criar a assinatura (se não estiver, `payment_url` vem nulo e `GET /v1/billing` devolve o link em `pending_payment_url`), se o cadastro de cliente aceita CNPJ alfanumérico e se há restrições para o domínio de `BILLING_SUCCESS_URL`.
 - O que **já foi conferido na documentação** (não no sandbox): o header `asaas-access-token` e a pausa da fila após 15 falhas; o formato de `dateCreated` (`AAAA-MM-DD HH:MM:SS`) e de `dueDate`; `payment.subscription` vindo só quando a cobrança pertence a uma assinatura; os filtros `externalReference` em `/subscriptions` e `/customers`; `limit` máximo de 100; os status de assinatura (`ACTIVE`, `EXPIRED`, `INACTIVE`) e de cobrança; e que `GET /subscriptions` **exclui as removidas por padrão** (`includeDeleted`/`deletedOnly` para o contrário). Como `EXPIRED` e `INACTIVE` não são removidas e voltam na listagem, é o filtro por `status === "ACTIVE"` que impede adotar uma assinatura que já não cobra nada.
 
 ## Outros limites conhecidos
+
+- Cadastro: não há bloqueio de e-mail descartável. A lista de domínios é interminável e envelhece rápido; se virar problema, o caminho é um provedor de reputação, não uma lista no repositório.
+- Cadastro: perder a chave exige recuperação manual (uma chave por e-mail, e a chave só aparece uma vez). Falta um fluxo de rotação.
+- Cadastro: não verificado contra o Resend real — o cliente foi conferido na documentação deles, mas nenhum e-mail foi enviado de verdade ainda.
 
 - Validação de CPF/CNPJ é só de formato e dígito verificador, não consulta situação cadastral na Receita.
 - Pix: só gera BR Code **estático**. O dinâmico (com a cobrança atrás de uma URL) exige integração com um PSP; o decodificador reconhece e lê os dois.
@@ -139,6 +167,7 @@ Sem credenciais do Redis o armazenamento cai para a memória local, o que serve 
 1. Importe o projeto na Vercel (framework: Other).
 2. Em Marketplace, adicione **Upstash Redis** ao projeto. Isso cria `UPSTASH_REDIS_REST_URL` e `UPSTASH_REDIS_REST_TOKEN` (os nomes `KV_REST_API_*` também funcionam).
 3. Defina `PUBLIC_BASE_URL` com o domínio público, sem barra no final (usado nos links curtos dos QR Codes) e as variáveis do Asaas descritas acima.
+   Para o cadastro público, defina também `RESEND_API_KEY` e `EMAIL_FROM` (ex.: `API <nao-responda@seu-dominio.com.br>`); o domínio precisa estar verificado no Resend.
 4. Faça o deploy e crie uma chave:
 
 ```bash
@@ -175,6 +204,8 @@ lib/
   validators.ts CPF e CNPJ (numérico e alfanumérico)
   pix.ts        BR Code do Pix (EMV/BACEN): monta, decodifica e CRC-16
   boleto.ts     linha digitável e código de barras (cobrança e arrecadação)
+  signup.ts     cadastro público: código de verificação e emissão da chave
+  email.ts      envio transacional pelo Resend (sem dependências)
   holidays.ts   feriados nacionais e dias úteis
   qr.ts         QR dinâmico
 scripts/create-key.ts
@@ -194,11 +225,12 @@ Lista mantida em ordem de prioridade. O que está em "verificação externa" nã
    - se `DUNNING_RECEIVED` significa de fato dinheiro creditado (foi inferido da descrição "payment received");
    - se `PUT /subscriptions` com `updatePendingPayments: true` realmente altera o valor da cobrança pendente.
 2. **Ler um QR Pix gerado aqui num app de banco de verdade.** O formato está conferido contra a especificação do BACEN e o CRC contra dois vetores independentes, mas nenhum QR foi escaneado. Usar valor baixo.
-3. **Conferir um boleto real.** Os algoritmos batem com os exemplos resolvidos da FEBRABAN e com um par código de barras/linha digitável de terceiro; falta passar uma linha digitável de boleto recebido de verdade.
+3. **Enviar um e-mail de verdade pelo Resend.** O cliente está conferido na documentação, mas nenhum e-mail saiu. Exige domínio verificado na conta.
+4. **Conferir um boleto real.** Os algoritmos batem com os exemplos resolvidos da FEBRABAN e com um par código de barras/linha digitável de terceiro; falta passar uma linha digitável de boleto recebido de verdade.
 
 ### Produto
 
-4. **Cadastro público de chaves com verificação de e-mail.** Hoje criar chave free é manual (`npm run create-key`), o que impede self-service. Precisa de provedor de e-mail — primeira dependência externa nova do projeto.
+4. **Rotação de chave.** Hoje, perder a chave exige recuperação manual: é uma por e-mail e ela só aparece na resposta da verificação.
 5. **Documentação OpenAPI e landing page.**
 6. **Revisar planos e preços** em `lib/plans.ts`, hoje provisórios, depois de medir custo real.
 
