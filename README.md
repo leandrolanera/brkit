@@ -25,6 +25,9 @@ Plataforma comum (chave de API, limite por minuto, cota mensal, medição e cobr
 | `POST /api/webhooks/asaas` | Webhook do Asaas (autenticado por token) |
 | `POST /v1/signup` `{ "email": "..." }` | Pede uma chave free: envia código de verificação (pública) |
 | `POST /v1/signup/verify` `{ "email", "code" }` | Confere o código e devolve a chave, uma única vez (pública) |
+| `POST /v1/keys/rotate` | Troca o segredo da chave atual (autenticado); a anterior morre na hora |
+| `POST /v1/keys/recover` `{ "email": "..." }` | Perdeu a chave: envia código para substituí-la (pública) |
+| `POST /v1/keys/recover/verify` `{ "email", "code" }` | Confere o código e devolve a chave nova (pública) |
 | `GET /v1/health` | Verificação de saúde (pública) |
 
 Autenticação: header `x-api-key: ak_live_...` ou `Authorization: Bearer ak_live_...`.
@@ -61,6 +64,32 @@ Decisões que valem saber:
 - **Uma chave por e-mail.** O código vale 30 minutos e aceita 5 tentativas; esgotadas, ele é invalidado e é preciso pedir outro. O contador usa `incr`, atômico, então chamadas simultâneas não furam o limite.
 - **Limites da rota pública:** 5 pedidos por minuto por IP e 2 por minuto por e-mail (para o cadastro não servir de ferramenta para inundar a caixa de alguém); 10 verificações por minuto por IP.
 - Envio pelo **Resend** (`POST /emails`, sem SDK). Sem `RESEND_API_KEY` e `EMAIL_FROM`, as duas rotas respondem 503 — inclusive a de verificação, porque devolver "código inválido" a quem nunca pôde receber um código seria enganoso.
+
+## Rotação e recuperação de chave
+
+Dois caminhos, para situações diferentes:
+
+```bash
+# Ainda tenho a chave e quero trocá-la (suspeita de vazamento, higiene periódica)
+curl -X POST https://SEU-DOMINIO/v1/keys/rotate -H "x-api-key: ak_live_..."
+
+# Perdi a chave: o e-mail é a identidade
+curl -X POST https://SEU-DOMINIO/v1/keys/recover \
+  -H "content-type: application/json" -d '{ "email": "voce@exemplo.com.br" }'
+curl -X POST https://SEU-DOMINIO/v1/keys/recover/verify \
+  -H "content-type: application/json" -d '{ "email": "voce@exemplo.com.br", "code": "ABCD2345" }'
+```
+
+**O id da chave é estável, o segredo é que roda.** Isso exigiu desacoplar as duas coisas: antes o id era o prefixo do hash do segredo, então trocar o segredo trocaria o id — e o id é a âncora da cota mensal, do limite por minuto, do registro de cobrança, do dono dos QR Codes e do `externalReference` da assinatura no Asaas. Uma rotação ingênua zeraria a cota, deixaria a cobrança órfã, tornaria os QR Codes inacessíveis e faria o próximo checkout criar uma **segunda assinatura**, reintroduzindo a cobrança em dobro. Agora o id é sorteado na criação e preservado na rotação; chaves criadas antes seguem válidas, porque nada recalcula o id a partir do segredo.
+
+O que mais vale saber:
+
+- **A chave anterior é revogada na hora.** Se a resposta da rotação se perder no caminho, a antiga já morreu e a nova é desconhecida: a saída é a recuperação por e-mail.
+- A ordem de gravação é nova chave → índice → remoção da antiga. Apagar primeiro deixaria, numa falha no meio, o `keyidx` apontando para um hash removido: a chave ficaria inalcançável até pelo id, e nem a recuperação consertaria. Em troca, uma falha pode deixar o segredo antigo valendo — repetir a rotação resolve.
+- **Recuperar é rotacionar**, não emitir chave nova: o plano, a cota do mês, os QR Codes e a assinatura são preservados.
+- `POST /v1/keys/recover` responde 202 em todo e-mail válido, exista chave ou não, pela mesma razão do cadastro. E-mail sem chave recebe um e-mail orientando o cadastro.
+- Cadastro e recuperação têm **baldes de limite separados** e **códigos separados por propósito**: um código pedido para criar chave não rotaciona a de ninguém. Hoje os dois nunca coexistem para o mesmo e-mail, então isso é defesa para um fluxo futuro.
+- Quem controla a caixa de e-mail consegue substituir a chave. É a propriedade inerente a qualquer recuperação por e-mail.
 
 ## Cobrança com Asaas
 
@@ -135,7 +164,7 @@ Atenção: o Asaas pode pausar a fila do webhook depois de 15 falhas seguidas. O
 ## Outros limites conhecidos
 
 - Cadastro: não há bloqueio de e-mail descartável. A lista de domínios é interminável e envelhece rápido; se virar problema, o caminho é um provedor de reputação, não uma lista no repositório.
-- Cadastro: perder a chave exige recuperação manual (uma chave por e-mail, e a chave só aparece uma vez). Falta um fluxo de rotação.
+- Rotação: não há período de carência. A chave antiga morre no mesmo instante, o que exige trocar a configuração do cliente de uma vez. Carência seria mais confortável em produção, mas deixaria um segredo vazado valendo por mais tempo.
 - Cadastro: não verificado contra o Resend real — o cliente foi conferido na documentação deles, mas nenhum e-mail foi enviado de verdade ainda.
 
 - Validação de CPF/CNPJ é só de formato e dígito verificador, não consulta situação cadastral na Receita.
@@ -196,7 +225,7 @@ api/            endpoints (um arquivo por rota, handlers no padrão Web Request/
 lib/
   withApi.ts    autenticação, limite, cota e medição
   rateLimit.ts  contador de janela por minuto (usado pelo withApi e pelo /r/:id)
-  auth.ts       chaves (somente hash armazenado) e plano em vigor
+  auth.ts       chaves (somente hash armazenado), plano em vigor e rotação do segredo
   billing.ts    checkout, cancelamento e processamento dos eventos do Asaas
   asaas.ts      cliente HTTP do Asaas (sem dependências)
   store.ts      Redis (Upstash) com fallback em memória
@@ -230,12 +259,12 @@ Lista mantida em ordem de prioridade. O que está em "verificação externa" nã
 
 ### Produto
 
-4. **Rotação de chave.** Hoje, perder a chave exige recuperação manual: é uma por e-mail e ela só aparece na resposta da verificação.
-5. **Documentação OpenAPI e landing page.**
-6. **Revisar planos e preços** em `lib/plans.ts`, hoje provisórios, depois de medir custo real.
+4. **Documentação OpenAPI e landing page.**
+5. **Revisar planos e preços** em `lib/plans.ts`, hoje provisórios, depois de medir custo real.
 
 ### Técnico
 
+6. **Carência na rotação**, se a troca sem janela se mostrar incômoda na prática: aceitar o segredo anterior por alguns minutos.
 7. **Reconciliação ativa**, por rotina agendada, em vez de só no `GET /v1/billing`. Hoje a autocura depende de o cliente consultar o status.
 8. **Paginação nas consultas ao Asaas.** O limite de 100 por página cobre mais de 8 anos de assinatura mensal, mas não é infinito.
 9. **HTML → PDF e screenshot.** Precisa de Chromium headless: avaliar a Vercel com build compacto ou uma VPS pequena. É projeto, não tarefa.

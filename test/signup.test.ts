@@ -220,7 +220,7 @@ describe("verifySignup", () => {
   test("sem pedido pendente não há o que verificar", async () => {
     await assert.rejects(
       () => verifySignup({ store }, EMAIL, "ABCD2345"),
-      (err: unknown) => err instanceof SignupError && err.code === "no_pending_signup",
+      (err: unknown) => err instanceof SignupError && err.code === "no_pending_code",
     );
   });
 
@@ -242,7 +242,7 @@ describe("verifySignup", () => {
     // E o código legítimo também deixa de valer: é preciso pedir outro.
     await assert.rejects(
       () => verifySignup({ store }, EMAIL, code),
-      (err: unknown) => err instanceof SignupError && err.code === "no_pending_signup",
+      (err: unknown) => err instanceof SignupError && err.code === "no_pending_code",
     );
   });
 

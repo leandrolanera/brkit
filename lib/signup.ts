@@ -1,5 +1,5 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import { createApiKey, type KeyRecord } from "./auth.js";
+import { createApiKey, rotateApiKey, type KeyRecord } from "./auth.js";
 import type { EmailSender } from "./email.js";
 import type { Store } from "./store.js";
 
@@ -27,8 +27,14 @@ const CODE_LENGTH = 8;
 
 const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
-const signupKey = (hash: string) => `signup:${hash}`;
-const attemptsKey = (hash: string) => `signupatt:${hash}`;
+/**
+ * Para que serve o código. Namespacear o armazenamento por propósito impede que um código
+ * pedido para criar chave sirva para rotacionar a de outra pessoa, e vice-versa.
+ */
+type Purpose = "signup" | "recover";
+
+const pendingKey = (purpose: Purpose, hash: string) => `${purpose}:${hash}`;
+const attemptsKey = (purpose: Purpose, hash: string) => `${purpose}att:${hash}`;
 const ownerKey = (hash: string) => `owner:${hash}`;
 
 export class SignupError extends Error {
@@ -94,10 +100,54 @@ export interface SignupDeps {
 }
 
 /** A verificação não envia e-mail, então não pede o remetente. */
-export type VerifyDeps = Pick<SignupDeps, "store">;
+export type VerifyDeps = Pick<SignupDeps, "store" | "now">;
 
 /**
- * Pede um código de verificação.
+ * Sorteia um código, grava o hash dele com prazo e zera o contador de tentativas.
+ * Gravar antes de enviar: se o envio falhar, o cliente repete e recebe um código novo, e o
+ * registro antigo cai pelo TTL. O contrário poderia confirmar um código que nunca chegou.
+ */
+async function issueCode(store: Store, purpose: Purpose, hash: string, now: Date): Promise<string> {
+  const code = generateCode();
+  const pending: PendingSignup = { codeHash: hashCode(code), createdAt: now.toISOString() };
+  await store.set(pendingKey(purpose, hash), pending, { exSeconds: CODE_TTL_SECONDS });
+  await store.del(attemptsKey(purpose, hash));
+  return code;
+}
+
+/**
+ * Confere o código e o consome.
+ *
+ * O contador de tentativas usa `incr`, que é atômico, então nem chamadas simultâneas furam o
+ * limite. Esgotado, o código é apagado: quem errou cinco vezes pede outro.
+ */
+async function consumeCode(store: Store, purpose: Purpose, hash: string, code: string): Promise<void> {
+  const pending = await store.get<PendingSignup>(pendingKey(purpose, hash));
+  if (!pending) {
+    throw new SignupError(
+      400,
+      "no_pending_code",
+      "Não há código pendente para este e-mail. Peça um novo antes de verificar.",
+    );
+  }
+
+  const attempts = await store.incr(attemptsKey(purpose, hash));
+  if (attempts === 1) await store.expire(attemptsKey(purpose, hash), CODE_TTL_SECONDS);
+  if (attempts > MAX_ATTEMPTS) {
+    await store.del(pendingKey(purpose, hash));
+    throw new SignupError(429, "too_many_attempts", "Tentativas esgotadas. Peça um novo código.");
+  }
+
+  if (typeof code !== "string" || !codeMatches(code, pending.codeHash)) {
+    throw new SignupError(400, "invalid_code", "Código inválido.");
+  }
+
+  await store.del(pendingKey(purpose, hash));
+  await store.del(attemptsKey(purpose, hash));
+}
+
+/**
+ * Pede um código para criar uma chave.
  *
  * Responde igual exista ou não chave para o e-mail: revelar a diferença daria um oráculo para
  * descobrir quem está cadastrado. Quem já tem chave recebe um e-mail dizendo isso, em vez de
@@ -114,23 +164,14 @@ export async function startSignup(deps: SignupDeps, rawEmail: string): Promise<v
       subject: "Sua chave de API já existe",
       text:
         "Recebemos um pedido de cadastro para este e-mail, mas já existe uma chave emitida para ele.\n\n" +
-        "Se você perdeu a sua chave, responda este e-mail: por ora a recuperação é manual.\n\n" +
+        "Se você perdeu a sua chave, peça uma nova em POST /v1/keys/recover com este mesmo e-mail:\n" +
+        "a chave atual será substituída.\n\n" +
         "Se não foi você que pediu, pode ignorar esta mensagem.",
     });
     return;
   }
 
-  const code = generateCode();
-  const pending: PendingSignup = {
-    codeHash: hashCode(code),
-    createdAt: (deps.now ?? new Date()).toISOString(),
-  };
-
-  // Grava antes de enviar: se o envio falhar, o cliente repete e recebe um código novo, e o
-  // registro antigo cai pelo TTL. O contrário poderia confirmar um código que nunca chegou.
-  await store.set(signupKey(hash), pending, { exSeconds: CODE_TTL_SECONDS });
-  await store.del(attemptsKey(hash));
-
+  const code = await issueCode(store, "signup", hash, deps.now ?? new Date());
   await deps.email.send({
     to: email,
     subject: "Seu código de verificação",
@@ -143,6 +184,43 @@ export async function startSignup(deps: SignupDeps, rawEmail: string): Promise<v
   });
 }
 
+/**
+ * Pede um código para substituir a chave de um e-mail que já tem uma.
+ *
+ * Mesma política de não revelar: e-mail sem chave recebe uma mensagem orientando o cadastro,
+ * em vez de um código, e a resposta HTTP é a mesma nos dois casos.
+ */
+export async function startRecovery(deps: SignupDeps, rawEmail: string): Promise<void> {
+  const { store } = deps;
+  const email = requireEmail(rawEmail);
+  const hash = hashEmail(email);
+
+  if (!(await store.get<string>(ownerKey(hash)))) {
+    await deps.email.send({
+      to: email,
+      subject: "Não há chave para este e-mail",
+      text:
+        "Recebemos um pedido de nova chave para este e-mail, mas não existe chave emitida para ele.\n\n" +
+        "Para criar uma, envie POST /v1/signup com este endereço.\n\n" +
+        "Se não foi você que pediu, pode ignorar esta mensagem.",
+    });
+    return;
+  }
+
+  const code = await issueCode(store, "recover", hash, deps.now ?? new Date());
+  await deps.email.send({
+    to: email,
+    subject: "Código para substituir sua chave de API",
+    text:
+      `Seu código é:\n\n    ${code}\n\n` +
+      `Ele vale por ${CODE_TTL_SECONDS / 60} minutos. Para receber a chave nova, envie:\n\n` +
+      `    POST /v1/keys/recover/verify\n    { "email": "${email}", "code": "${code}" }\n\n` +
+      "ATENÇÃO: ao concluir, a chave atual deixa de funcionar na hora. Plano, cota do mês, " +
+      "QR Codes e assinatura são preservados.\n\n" +
+      "Se não foi você que pediu, ignore esta mensagem — sua chave atual segue valendo.",
+  });
+}
+
 export interface VerifyResult {
   /** Texto puro da chave. Só existe aqui: o que fica guardado é o hash. */
   api_key: string;
@@ -150,10 +228,7 @@ export interface VerifyResult {
 }
 
 /**
- * Confere o código e emite a chave.
- *
- * O contador de tentativas usa `incr`, que é atômico, então nem chamadas simultâneas furam o
- * limite. Esgotado, o código é apagado: quem errou cinco vezes pede outro.
+ * Confere o código e emite a chave nova do cadastro.
  */
 export async function verifySignup(deps: VerifyDeps, rawEmail: string, code: string): Promise<VerifyResult> {
   const { store } = deps;
@@ -161,35 +236,52 @@ export async function verifySignup(deps: VerifyDeps, rawEmail: string, code: str
   const hash = hashEmail(email);
 
   if (await store.get<string>(ownerKey(hash))) {
-    throw new SignupError(409, "key_already_issued", "Já existe uma chave emitida para este e-mail.");
-  }
-
-  const pending = await store.get<PendingSignup>(signupKey(hash));
-  if (!pending) {
     throw new SignupError(
-      400,
-      "no_pending_signup",
-      "Não há código pendente para este e-mail. Peça um novo em POST /v1/signup.",
+      409,
+      "key_already_issued",
+      "Já existe uma chave emitida para este e-mail. Para substituí-la, use POST /v1/keys/recover.",
     );
   }
 
-  const attempts = await store.incr(attemptsKey(hash));
-  if (attempts === 1) await store.expire(attemptsKey(hash), CODE_TTL_SECONDS);
-  if (attempts > MAX_ATTEMPTS) {
-    await store.del(signupKey(hash));
-    throw new SignupError(429, "too_many_attempts", "Tentativas esgotadas. Peça um novo código em POST /v1/signup.");
-  }
-
-  if (typeof code !== "string" || !codeMatches(code, pending.codeHash)) {
-    throw new SignupError(400, "invalid_code", "Código inválido.");
-  }
+  await consumeCode(store, "signup", hash, code);
 
   const { key, record } = await createApiKey(store, email, "free");
   // Índice de dono: é o que garante uma chave por e-mail. Gravado depois da chave, para não
   // bloquear o e-mail se a criação falhar no meio.
   await store.set(ownerKey(hash), record.id);
-  await store.del(signupKey(hash));
-  await store.del(attemptsKey(hash));
 
   return { api_key: key, record };
+}
+
+/**
+ * Confere o código e substitui a chave do e-mail.
+ *
+ * É o caminho para quem perdeu a chave: o e-mail é a identidade, então quem prova acesso a ele
+ * recebe uma chave nova. O id é preservado, e com ele o plano, a cota do mês, os QR Codes e o
+ * vínculo com a assinatura — ver rotateApiKey.
+ */
+export async function verifyRecovery(deps: VerifyDeps, rawEmail: string, code: string): Promise<VerifyResult> {
+  const { store } = deps;
+  const email = requireEmail(rawEmail);
+  const hash = hashEmail(email);
+
+  const keyId = await store.get<string>(ownerKey(hash));
+  if (!keyId) {
+    throw new SignupError(
+      404,
+      "no_key_for_email",
+      "Não há chave emitida para este e-mail. Use POST /v1/signup para criar uma.",
+    );
+  }
+
+  await consumeCode(store, "recover", hash, code);
+
+  const rotated = await rotateApiKey(store, keyId, deps.now ?? new Date());
+  if (!rotated) {
+    // Índice de dono apontando para uma chave inexistente: estado inconsistente, não um erro
+    // do cliente. Deixa alto para aparecer no log.
+    throw new SignupError(500, "key_missing", "A chave vinculada a este e-mail não foi encontrada.");
+  }
+
+  return { api_key: rotated.key, record: rotated.record };
 }

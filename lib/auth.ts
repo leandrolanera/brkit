@@ -3,7 +3,18 @@ import type { PlanId } from "./plans.js";
 import type { Store } from "./store.js";
 
 export interface KeyRecord {
-  /** Identificador público e estável da chave (derivado do hash). */
+  /**
+   * Identificador público e estável, sorteado na criação e **preservado na rotação**.
+   *
+   * Não pode ser derivado do hash do segredo: o id é a âncora da cota mensal, do limite por
+   * minuto, do registro de cobrança, do dono dos QR Codes e do `externalReference` da
+   * assinatura no Asaas. Se mudasse junto com o segredo, rotacionar zeraria a cota, órfãozaria
+   * a cobrança, tornaria os QR Codes inacessíveis e faria um novo checkout criar uma segunda
+   * assinatura — a cobrança em dobro que `findActiveSubscription` existe para evitar.
+   *
+   * Chaves criadas antes desta mudança têm id derivado do hash. Continuam válidas: nada
+   * recalcula o id a partir do segredo, ele é lido do registro gravado.
+   */
   id: string;
   plan: PlanId;
   owner: string;
@@ -13,6 +24,8 @@ export interface KeyRecord {
    * Ausente = plano concedido manualmente, sem vencimento.
    */
   planUntil?: string;
+  /** Última rotação do segredo (ISO). Ausente = nunca rotacionada. */
+  rotatedAt?: string;
 }
 
 export function hashKey(key: string): string {
@@ -21,6 +34,11 @@ export function hashKey(key: string): string {
 
 export function generateKey(): string {
   return `ak_live_${randomBytes(24).toString("hex")}`;
+}
+
+/** Id público da chave. Mesmo formato de antes (12 hex), mas independente do segredo. */
+export function generateKeyId(): string {
+  return randomBytes(6).toString("hex");
 }
 
 /** Cria e grava uma chave. A chave em texto puro só existe neste retorno: guarde-a agora. */
@@ -32,13 +50,43 @@ export async function createApiKey(
   const key = generateKey();
   const hash = hashKey(key);
   const record: KeyRecord = {
-    id: hash.slice(0, 12),
+    id: generateKeyId(),
     plan,
     owner,
     createdAt: new Date().toISOString(),
   };
   await store.set(`key:${hash}`, record);
   await store.set(`keyidx:${record.id}`, hash);
+  return { key, record };
+}
+
+/**
+ * Troca o segredo de uma chave, preservando o id — e com ele a cota do mês, o plano pago, os
+ * QR Codes e o vínculo com a assinatura no Asaas. O segredo anterior deixa de autenticar.
+ *
+ * Devolve null se o id não existir.
+ *
+ * A ordem importa: grava o novo, aponta o índice e só então apaga o antigo. Apagar primeiro
+ * deixaria, numa falha no meio, o `keyidx` apontando para um hash já removido — a chave ficaria
+ * inalcançável até pelo id, e nem a recuperação por e-mail conseguiria consertar. Em troca, uma
+ * falha pode deixar o segredo antigo valendo; repetir a rotação resolve.
+ */
+export async function rotateApiKey(
+  store: Store,
+  id: string,
+  now = new Date(),
+): Promise<{ key: string; record: KeyRecord } | null> {
+  const found = await getKeyById(store, id);
+  if (!found) return null;
+
+  const key = generateKey();
+  const hash = hashKey(key);
+  const record: KeyRecord = { ...found.record, rotatedAt: now.toISOString() };
+
+  await store.set(`key:${hash}`, record);
+  await store.set(`keyidx:${id}`, hash);
+  if (found.hash !== hash) await store.del(`key:${found.hash}`);
+
   return { key, record };
 }
 
