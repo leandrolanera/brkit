@@ -1,0 +1,13 @@
+node_modules/
+
+# Credenciais: Redis (Upstash) e Asaas. Nunca versionar.
+.env
+.env.*
+!.env.example
+
+.vercel/
+
+*.log
+npm-debug.log*
+
+.DS_Store

@@ -1,0 +1,26 @@
+{
+  "name": "apis-portfolio",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Plataforma comum (chave de API, limite, medição) + APIs monetizáveis para a Vercel",
+  "scripts": {
+    "dev": "vercel dev",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test \"test/**/*.test.ts\"",
+    "create-key": "tsx scripts/create-key.ts"
+  },
+  "dependencies": {
+    "@upstash/redis": "^1.34.0",
+    "qrcode": "^1.5.4"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/qrcode": "^1.5.5",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
