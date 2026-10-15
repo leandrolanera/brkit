@@ -27,6 +27,7 @@ Toda resposta autenticada traz `x-ratelimit-*` e `x-usage-*`. Erros seguem o for
 ### Regras da plataforma
 
 - O limite por minuto conta toda requisição autenticada, inclusive as que falham.
+- A rota pública `/r/:id` não tem chave, então é limitada por IP: 60 leituras por minuto. O IP vem de `x-vercel-forwarded-for`, `x-real-ip` ou da última entrada de `x-forwarded-for` — a Vercel sobrescreve esse header com um IP só, justamente para impedir spoofing. Fora da Vercel, sem nenhum desses headers, o limite passa a ser por código (um balde único global derrubaria todos os links de uma vez).
 - A cota mensal (mês em UTC) só é debitada quando a resposta é bem-sucedida (< 400). O débito é por reserva: a unidade é separada antes de chamar o endpoint e devolvida se a cota estourou ou se a resposta falhou, para que chamadas simultâneas na borda da cota não furem o limite. Um processo derrubado entre a reserva e a devolução deixa até `cost` unidades consumidas à toa, zeradas na virada do mês.
 - `withApi(handler, { cost: N })` cobra N unidades por chamada, o gancho para os endpoints com IA quando entrarem os créditos pré-pagos.
 - `withApi(handler, { cost: 0 })` não consome nem exige cota. É o caso dos endpoints de cobrança, que precisam funcionar justamente quando a cota acabou.
@@ -77,7 +78,7 @@ Atenção: o Asaas pode pausar a fila do webhook depois de 15 falhas seguidas. O
 - Validação de CPF/CNPJ é só de formato e dígito verificador, não consulta situação cadastral na Receita.
 - Feriados: só federais. Estaduais e municipais ficam para uma próxima versão.
 - QR dinâmico é um redirecionador: um serviço assim pode ser usado para phishing. Antes de abrir ao público, adicione termos de uso, denúncia de links e (idealmente) verificação do destino contra listas de URLs maliciosas.
-- A rota pública `/r/:id` ainda não tem limite de taxa.
+- A rota pública `/r/:id` é limitada a 60 leituras por minuto por IP (ver abaixo). O limite é por janela fixa de um minuto, então dois picos na virada podem somar até 2× — contém abuso, não é cota precisa.
 
 ## Rodando
 
@@ -121,6 +122,7 @@ api/            endpoints (um arquivo por rota, handlers no padrão Web Request/
   redirect.ts         rota pública do QR dinâmico
 lib/
   withApi.ts    autenticação, limite, cota e medição
+  rateLimit.ts  contador de janela por minuto (usado pelo withApi e pelo /r/:id)
   auth.ts       chaves (somente hash armazenado) e plano em vigor
   billing.ts    checkout, cancelamento e processamento dos eventos do Asaas
   asaas.ts      cliente HTTP do Asaas (sem dependências)

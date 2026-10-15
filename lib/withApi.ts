@@ -1,6 +1,7 @@
 import { effectivePlan, extractKey, lookupKey, type KeyRecord } from "./auth.js";
 import { apiError } from "./http.js";
 import { PLANS } from "./plans.js";
+import { rateLimitPerMinute } from "./rateLimit.js";
 import { getStore, type Store } from "./store.js";
 
 export interface ApiContext {
@@ -53,14 +54,11 @@ export function withApi(handler: ApiHandler, opts: { cost?: number } = {}) {
       const plan = PLANS[effectivePlan(key)];
       const now = new Date();
 
-      const minute = Math.floor(now.getTime() / 60_000);
-      const rlKey = `rl:${key.id}:${minute}`;
-      const hits = await store.incr(rlKey);
-      if (hits === 1) await store.expire(rlKey, 120);
-      if (hits > plan.perMinute) {
+      const rate = await rateLimitPerMinute(store, `rl:${key.id}`, plan.perMinute, now);
+      if (!rate.allowed) {
         return apiError(429, "rate_limited", "Limite de requisições por minuto excedido.", {
-          "retry-after": String(60 - now.getUTCSeconds()),
-          "x-ratelimit-limit": String(plan.perMinute),
+          "retry-after": String(rate.retryAfter),
+          "x-ratelimit-limit": String(rate.limit),
           "x-ratelimit-remaining": "0",
         });
       }
@@ -90,8 +88,8 @@ export function withApi(handler: ApiHandler, opts: { cost?: number } = {}) {
       if (res.status >= 400) used = (await refund()) ?? used;
 
       const headers = new Headers(res.headers);
-      headers.set("x-ratelimit-limit", String(plan.perMinute));
-      headers.set("x-ratelimit-remaining", String(Math.max(0, plan.perMinute - hits)));
+      headers.set("x-ratelimit-limit", String(rate.limit));
+      headers.set("x-ratelimit-remaining", String(rate.remaining));
       headers.set("x-usage-limit", String(plan.monthlyQuota));
       headers.set("x-usage-remaining", String(Math.max(0, plan.monthlyQuota - used)));
       return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
