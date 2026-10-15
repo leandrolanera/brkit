@@ -1,0 +1,611 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>apis.br — Pix, boleto, CPF e CNPJ por HTTP</title>
+<meta name="description" content="APIs para os formatos do Brasil: BR Code do Pix, linha digitável de boleto, CPF e CNPJ, feriados. Chave gratuita por e-mail, sem cartão.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Chivo:ital,wght@0,400;0,700;0,900;1,400&family=Azeret+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+  /* ---------------------------------------------------------------------
+     Paleta derivada das notas do Real: as cores CODIFICAM as famílias de
+     API, nunca decoram. Papel com tinta de segurança, tinta offset.
+     --------------------------------------------------------------------- */
+  :root {
+    --paper:     #e7eae4;
+    --paper-dim: #dde1d9;
+    --ink:       #11201f;
+    --ink-soft:  #55635f;
+    --rule:      #c0c8be;
+    --rule-firm: #8e9a8c;
+
+    --pix:    #1f6f5c;
+    --boleto: #a8402a;
+    --doc:    #3f4f96;
+    --qr:     #6e4682;
+    --dates:  #a8761a;
+
+    /* Azeret Mono é reservada a dado de máquina. Chivo para tudo humano. */
+    --human: "Chivo", ui-sans-serif, system-ui, sans-serif;
+    --machine: "Azeret Mono", ui-monospace, "SF Mono", Menlo, monospace;
+
+    --measure: 66ch;
+    --gutter: clamp(1.25rem, 5vw, 4rem);
+  }
+
+  *, *::before, *::after { box-sizing: border-box; }
+
+  html { -webkit-text-size-adjust: 100%; }
+
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font: 400 1.0625rem/1.6 var(--human);
+    font-synthesis: none;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--ink);
+    outline-offset: 3px;
+  }
+
+  a { color: inherit; }
+
+  .wrap {
+    max-width: 68rem;
+    margin-inline: auto;
+    padding-inline: var(--gutter);
+  }
+
+  /* --- cabeçalho ----------------------------------------------------- */
+  .top {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 1rem;
+    padding-block: 1.5rem 1.25rem;
+    border-bottom: 1px solid var(--rule);
+    flex-wrap: wrap;
+  }
+  .mark {
+    font: 900 1.125rem/1 var(--human);
+    letter-spacing: -0.02em;
+    text-decoration: none;
+  }
+  .mark span { color: var(--ink-soft); font-weight: 400; }
+  .top nav {
+    display: flex;
+    gap: 1.5rem;
+    font-size: 0.9375rem;
+  }
+  .top nav a { text-decoration-color: var(--rule-firm); text-underline-offset: 3px; }
+  .top nav a:hover { text-decoration-color: currentColor; }
+
+  /* --- herói --------------------------------------------------------- */
+  .hero { padding-block: clamp(3rem, 9vw, 6rem) 0; }
+
+  h1 {
+    font: 900 clamp(2.5rem, 7.5vw, 5rem)/0.98 var(--human);
+    letter-spacing: -0.035em;
+    margin: 0 0 1.25rem;
+    max-width: 24ch;
+    text-wrap: balance;
+  }
+  .lede {
+    margin: 0 0 clamp(2.5rem, 6vw, 3.5rem);
+    max-width: var(--measure);
+    font-size: 1.1875rem;
+    color: var(--ink-soft);
+  }
+  .lede strong { color: var(--ink); font-weight: 700; }
+
+  /* --- seletor de artefato ------------------------------------------- */
+  .switch {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0;
+    margin-bottom: -1px;
+  }
+  .switch button {
+    appearance: none;
+    background: transparent;
+    border: 1px solid var(--rule);
+    border-bottom-color: var(--rule-firm);
+    margin-right: -1px;
+    padding: 0.5rem 1rem;
+    font: 400 0.875rem/1 var(--human);
+    color: var(--ink-soft);
+    cursor: pointer;
+  }
+  .switch button:hover { color: var(--ink); }
+  .switch button[aria-selected="true"] {
+    background: var(--paper);
+    color: var(--ink);
+    font-weight: 700;
+    border-color: var(--rule-firm);
+    border-bottom-color: var(--paper);
+    position: relative;
+    z-index: 1;
+    box-shadow: inset 0 3px 0 var(--family, var(--ink));
+  }
+
+  /* --- caixa de campo: o vernáculo da ficha de compensação -----------
+     O rótulo vive DENTRO da caixa, no alto à esquerda, como no boleto.
+     Caixa só envolve dado de máquina — prosa nunca ganha caixa.         */
+  .sheet {
+    border: 1px solid var(--rule-firm);
+    background: #eef0ea;
+  }
+  .field {
+    padding: 0.75rem 1rem 0.875rem;
+    border-top: 1px solid var(--rule);
+  }
+  .field:first-child { border-top: 0; }
+  .field > .label {
+    display: block;
+    font: 400 0.75rem/1 var(--human);
+    color: var(--ink-soft);
+    margin-bottom: 0.5rem;
+  }
+
+  .string {
+    font: 500 clamp(0.9375rem, 2.6vw, 1.5rem)/1.45 var(--machine);
+    letter-spacing: -0.02em;
+    /* Cadeia contínua (BR Code) pode quebrar em qualquer ponto... */
+    overflow-wrap: anywhere;
+    margin: 0;
+  }
+  /* ...mas onde há agrupamento (boleto, CNPJ) o bloco é a informação e
+     não pode partir no meio. Quebra entre blocos, nunca dentro. */
+  .string .blk { display: inline-block; white-space: nowrap; }
+
+  /* O dígito verificador é marcado por RÉGUA, não por cor do glifo:
+     codifica "este dígito confere os anteriores". */
+  .dv {
+    font-weight: 700;
+    border-bottom: 3px solid var(--family, var(--ink));
+    padding-bottom: 1px;
+  }
+
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr));
+    border-top: 1px solid var(--rule);
+  }
+  .grid .field { border-top: 0; border-left: 1px solid var(--rule); }
+  .grid .field:first-child { border-left: 0; }
+  .grid .value {
+    font: 500 1.0625rem/1.3 var(--machine);
+    letter-spacing: -0.01em;
+  }
+  .grid .value.text { font-family: var(--human); font-weight: 700; letter-spacing: 0; }
+
+  .verdict {
+    display: flex;
+    align-items: center;
+    gap: 0.625rem;
+    padding: 0.75rem 1rem;
+    border-top: 1px solid var(--rule-firm);
+    background: var(--paper-dim);
+    font-size: 0.9375rem;
+  }
+  .verdict b { font-weight: 700; color: var(--family, var(--ink)); }
+  .verdict .req {
+    margin-left: auto;
+    font: 400 0.8125rem/1 var(--machine);
+    color: var(--ink-soft);
+  }
+
+  [hidden] { display: none !important; }
+
+  /* --- faixa ITF: usada UMA vez, como no pé de um boleto ------------- */
+  .bars {
+    margin-block: clamp(3rem, 8vw, 5rem);
+    height: 3.25rem;
+    background-repeat: repeat-x;
+    background-size: 44px 100%;
+    background-image: repeating-linear-gradient(90deg,
+      var(--ink) 0 2px, transparent 2px 5px,
+      var(--ink) 5px 11px, transparent 11px 14px,
+      var(--ink) 14px 16px, transparent 16px 21px,
+      var(--ink) 21px 27px, transparent 27px 30px,
+      var(--ink) 30px 32px, transparent 32px 37px,
+      var(--ink) 37px 41px, transparent 41px 44px);
+  }
+
+  /* --- seções -------------------------------------------------------- */
+  section + section { margin-top: clamp(3.5rem, 9vw, 6rem); }
+
+  h2 {
+    font: 900 clamp(1.625rem, 3.6vw, 2.25rem)/1.1 var(--human);
+    letter-spacing: -0.025em;
+    margin: 0 0 0.75rem;
+  }
+  .note {
+    margin: 0 0 2rem;
+    max-width: var(--measure);
+    color: var(--ink-soft);
+  }
+
+  /* --- catálogo: tabela, não cartões idênticos ----------------------- */
+  .catalogue { width: 100%; border-collapse: collapse; text-align: left; }
+  .catalogue th {
+    font: 400 0.75rem/1 var(--human);
+    color: var(--ink-soft);
+    padding: 0 0 0.625rem;
+    border-bottom: 1px solid var(--rule-firm);
+    font-weight: 400;
+  }
+  .catalogue td {
+    padding: 1.125rem 1rem 1.125rem 0;
+    border-bottom: 1px solid var(--rule);
+    vertical-align: top;
+  }
+  .catalogue td:last-child { padding-right: 0; }
+  .catalogue tbody tr > td:first-child {
+    border-left: 4px solid var(--family);
+    padding-left: 0.875rem;
+    font-weight: 700;
+    white-space: nowrap;
+  }
+  .catalogue .routes {
+    font: 400 0.875rem/1.7 var(--machine);
+    letter-spacing: -0.01em;
+    color: var(--ink);
+  }
+  .catalogue .what { color: var(--ink-soft); font-size: 0.9375rem; max-width: 40ch; }
+
+  /* --- cadastro: duas etapas, sequência de verdade ------------------- */
+  .steps { counter-reset: step; margin: 0; padding: 0; list-style: none; }
+  .steps > li { counter-increment: step; display: grid; grid-template-columns: 2.5rem minmax(0, 1fr); gap: 0 1rem; }
+  /* Sem min-width 0, o item de grid herda min-width:auto e o <pre> alarga a
+     coluna em vez de rolar dentro da própria caixa. */
+  .steps > li > div { min-width: 0; }
+  .steps > li + li { margin-top: 1.75rem; }
+  .steps > li::before {
+    content: counter(step, decimal-leading-zero);
+    font: 700 0.875rem/1.8 var(--machine);
+    color: var(--ink-soft);
+  }
+  .steps h3 { font: 700 1.0625rem/1.6 var(--human); margin: 0 0 0.625rem; }
+  .steps p { margin: 0.625rem 0 0; color: var(--ink-soft); font-size: 0.9375rem; max-width: 56ch; }
+
+  .cmd { position: relative; border: 1px solid var(--rule-firm); background: var(--ink); }
+  .cmd pre {
+    margin: 0;
+    padding: 0.875rem 1rem;
+    overflow-x: auto;
+    color: #dfe6e2;
+    font: 400 0.875rem/1.7 var(--machine);
+    letter-spacing: -0.01em;
+  }
+  .cmd .flag { color: #93a8a1; }
+  .cmd .str { color: #a9cfbf; }
+  .cmd button {
+    position: absolute;
+    top: 0.5rem;
+    right: 0.5rem;
+    appearance: none;
+    background: #1d302e;
+    color: #cfd9d5;
+    border: 1px solid #35504c;
+    padding: 0.3125rem 0.625rem;
+    font: 400 0.75rem/1 var(--human);
+    cursor: pointer;
+  }
+  .cmd button:hover { background: #26403d; color: #fff; }
+
+  /* --- limites: a seção honesta -------------------------------------- */
+  .limits { margin: 0; max-width: 46rem; }
+  .limits div { display: grid; grid-template-columns: minmax(8rem, 11.5rem) 1fr; gap: 0 1.5rem; padding-block: 0.875rem; border-top: 1px solid var(--rule); }
+  .limits div:first-child { border-top: 1px solid var(--rule-firm); }
+  .limits dt { font-weight: 700; }
+  .limits dd { margin: 0; color: var(--ink-soft); }
+
+  footer {
+    margin-top: clamp(4rem, 10vw, 7rem);
+    padding-block: 1.5rem 3rem;
+    border-top: 1px solid var(--rule-firm);
+    display: flex;
+    justify-content: space-between;
+    gap: 1rem 2rem;
+    flex-wrap: wrap;
+    font-size: 0.875rem;
+    color: var(--ink-soft);
+  }
+  footer nav { display: flex; gap: 1.5rem; }
+
+  /* --- uma sequência de entrada, só no carregamento ------------------ */
+  @media (prefers-reduced-motion: no-preference) {
+    .enter { animation: rise 0.6s cubic-bezier(0.2, 0, 0.2, 1) backwards; }
+    .enter:nth-child(1) { animation-delay: 0.05s; }
+    .enter:nth-child(2) { animation-delay: 0.14s; }
+    .enter:nth-child(3) { animation-delay: 0.23s; }
+    @keyframes rise {
+      from { opacity: 0; transform: translateY(0.75rem); }
+      to   { opacity: 1; transform: none; }
+    }
+  }
+
+  @media (max-width: 34rem) {
+    .grid { grid-template-columns: 1fr 1fr; }
+    .grid .field:nth-child(odd) { border-left: 0; }
+    .grid .field:nth-child(n+3) { border-top: 1px solid var(--rule); }
+    .catalogue thead { display: none; }
+    .catalogue td { display: block; border-bottom: 0; padding-block: 0.25rem; }
+    .catalogue tbody tr { display: block; border-bottom: 1px solid var(--rule); padding-block: 1rem 1.125rem; }
+    .limits div { grid-template-columns: 1fr; gap: 0.25rem; }
+    .verdict { flex-wrap: wrap; }
+    .verdict .req { margin-left: 0; flex-basis: 100%; }
+  }
+</style>
+</head>
+<body>
+
+<div class="wrap">
+  <header class="top">
+    <a class="mark" href="/">apis<span>.br</span></a>
+    <nav>
+      <a href="/v1/openapi.json">Especificação</a>
+      <a href="#chave">Criar chave</a>
+    </nav>
+  </header>
+
+  <main>
+    <section class="hero">
+      <h1 class="enter">Os formatos do Brasil, conferidos.</h1>
+      <p class="lede enter">
+        Gere e leia BR Code do Pix, linha digitável de boleto, CPF e CNPJ por HTTP.
+        Os algoritmos saíram da especificação do BACEN e do layout da FEBRABAN, e os
+        <strong>vetores de teste oficiais estão no repositório</strong> — inclusive o fator de
+        vencimento reiniciado em fevereiro de 2025, que a maioria das implementações ainda erra.
+      </p>
+
+      <div class="enter">
+        <div class="switch" role="tablist" aria-label="Exemplos de resposta">
+          <button role="tab" id="t-boleto" aria-controls="p-boleto" aria-selected="true"  style="--family: var(--boleto)">Boleto</button>
+          <button role="tab" id="t-pix"    aria-controls="p-pix"    aria-selected="false" style="--family: var(--pix)">Pix</button>
+          <button role="tab" id="t-doc"    aria-controls="p-doc"    aria-selected="false" style="--family: var(--doc)">CNPJ</button>
+          <button role="tab" id="t-dates"  aria-controls="p-dates"  aria-selected="false" style="--family: var(--dates)">Feriados</button>
+        </div>
+
+        <!-- Boleto: cadeia agrupada como o boleto imprime; os dígitos
+             verificadores levam régua. Dados gerados pelo próprio código. -->
+        <div class="sheet" role="tabpanel" id="p-boleto" aria-labelledby="t-boleto" style="--family: var(--boleto)">
+          <div class="field">
+            <span class="label">Linha digitável</span>
+            <p class="string"><span class="blk">00190.0000<span class="dv">9</span></span>&nbsp; <span class="blk">00012.34567<span class="dv">4</span></span>&nbsp; <span class="blk">89012.34567<span class="dv">7</span></span>&nbsp; <span class="blk dv">4</span>&nbsp; <span class="blk">16360000124790</span></p>
+          </div>
+          <div class="grid">
+            <div class="field"><span class="label">Banco</span><span class="value text">Banco do Brasil</span></div>
+            <div class="field"><span class="label">Valor</span><span class="value">R$ 1.247,90</span></div>
+            <div class="field"><span class="label">Vencimento</span><span class="value">20/11/2026</span></div>
+            <div class="field"><span class="label">Fator</span><span class="value">1636</span></div>
+          </div>
+          <p class="verdict"><b>Confere.</b> Quatro dígitos verificadores: três por módulo 10, o geral por módulo 11.
+            <span class="req">POST /v1/boleto/decode</span></p>
+        </div>
+
+        <!-- Pix: o CRC-16 final é a prova que a cadeia carrega de si mesma. -->
+        <div class="sheet" role="tabpanel" id="p-pix" aria-labelledby="t-pix" hidden style="--family: var(--pix)">
+          <div class="field">
+            <span class="label">BR Code (Pix copia e cola)</span>
+            <p class="string">00020101021126440014br.gov.bcb.pix0122contato@exemplo.com.br520400005303986540589.905802BR5918Livraria Sao Jorge6009Sao Paulo62140510PEDIDO44716304<span class="dv">8244</span></p>
+          </div>
+          <div class="grid">
+            <div class="field"><span class="label">Beneficiário</span><span class="value text">Livraria Sao Jorge</span></div>
+            <div class="field"><span class="label">Valor</span><span class="value">R$ 89,90</span></div>
+            <div class="field"><span class="label">Chave</span><span class="value text">e-mail</span></div>
+            <div class="field"><span class="label">txid</span><span class="value">PEDIDO4471</span></div>
+          </div>
+          <p class="verdict"><b>Confere.</b> O CRC-16 inclui o próprio marcador <span style="font-family:var(--machine)">6304</span> no cálculo — é aí que quase todo gerador erra.
+            <span class="req">POST /v1/pix/qr</span></p>
+        </div>
+
+        <!-- CNPJ alfanumérico: exemplo oficial da Receita. -->
+        <div class="sheet" role="tabpanel" id="p-doc" aria-labelledby="t-doc" hidden style="--family: var(--doc)">
+          <div class="field">
+            <span class="label">CNPJ alfanumérico</span>
+            <p class="string"><span class="blk">12.ABC.345/01DE-<span class="dv">35</span></span></p>
+          </div>
+          <div class="grid">
+            <div class="field"><span class="label">Tipo</span><span class="value text">alfanumérico</span></div>
+            <div class="field"><span class="label">Normalizado</span><span class="value">12ABC34501DE35</span></div>
+            <div class="field"><span class="label">CPF também</span><span class="value">529.982.247-25</span></div>
+          </div>
+          <p class="verdict"><b>Confere.</b> Módulo 11 com cada caractere valendo o código ASCII menos 48, como manda o formato em vigor desde julho de 2026.
+            <span class="req">GET /v1/validate/cnpj</span></p>
+        </div>
+
+        <!-- Feriados: sem dígito verificador; a prova aqui é a lei citada. -->
+        <div class="sheet" role="tabpanel" id="p-dates" aria-labelledby="t-dates" hidden style="--family: var(--dates)">
+          <div class="field">
+            <span class="label">Feriados nacionais de 2026 (4 dos 10)</span>
+            <p class="string"><span class="blk">2026-01-01</span>&nbsp; <span class="blk">2026-04-03</span>&nbsp; <span class="blk">2026-04-21</span>&nbsp; <span class="blk">2026-05-01</span></p>
+          </div>
+          <div class="grid">
+            <div class="field"><span class="label">Sexta-feira Santa</span><span class="value">03/04/2026</span></div>
+            <div class="field"><span class="label">Consciência Negra</span><span class="value">20/11/2026</span></div>
+            <div class="field"><span class="label">Dias úteis em outubro</span><span class="value">21</span></div>
+          </div>
+          <p class="verdict"><b>Confere.</b> Páscoa por Meeus/Jones/Butcher, e a Consciência Negra como feriado nacional desde a Lei 14.759/2023.
+            <span class="req">GET /v1/holidays</span></p>
+        </div>
+      </div>
+    </section>
+
+    <div class="bars" role="presentation"></div>
+
+    <section>
+      <h2>O que tem hoje</h2>
+      <p class="note">Tudo calculado aqui, sem consultar terceiros. Resposta em JSON, erro sempre
+        no formato <span style="font-family:var(--machine);font-size:0.9375em">{ "error": { "code", "message" } }</span>.</p>
+
+      <table class="catalogue">
+        <thead>
+          <tr><th>Família</th><th>Rotas</th><th>O que faz</th></tr>
+        </thead>
+        <tbody>
+          <tr style="--family: var(--pix)">
+            <td>Pix</td>
+            <td class="routes">POST /v1/pix/qr<br>POST /v1/pix/decode</td>
+            <td class="what">Monta o copia e cola e a imagem do QR. Lê um código recebido e confere o CRC.</td>
+          </tr>
+          <tr style="--family: var(--boleto)">
+            <td>Boleto</td>
+            <td class="routes">POST /v1/boleto/decode</td>
+            <td class="what">Valida linha digitável e código de barras, converte entre as duas, extrai banco, valor e vencimento. Cobrança bancária e arrecadação.</td>
+          </tr>
+          <tr style="--family: var(--doc)">
+            <td>Documentos</td>
+            <td class="routes">GET /v1/validate/cnpj<br>POST /v1/validate/cpf</td>
+            <td class="what">CPF e CNPJ, numérico e alfanumérico. CPF só por POST: é dado pessoal e query string vai para log.</td>
+          </tr>
+          <tr style="--family: var(--qr)">
+            <td>QR Code</td>
+            <td class="routes">GET /v1/qr<br>POST /v1/qr/codes</td>
+            <td class="what">QR estático em PNG ou SVG. O dinâmico tem destino editável depois de impresso, com contagem de leituras.</td>
+          </tr>
+          <tr style="--family: var(--dates)">
+            <td>Feriados</td>
+            <td class="routes">GET /v1/holidays<br>GET /v1/holidays/business-days</td>
+            <td class="what">Feriados nacionais e pontos facultativos federais. Conta dias úteis entre duas datas.</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section id="chave">
+      <h2>Criar uma chave</h2>
+      <p class="note">Gratuito, sem cartão: 1.000 chamadas por mês e 10 por minuto. Precisa de um
+        e-mail que você consiga abrir.</p>
+
+      <ol class="steps">
+        <li>
+          <div>
+            <h3>Peça o código</h3>
+            <div class="cmd">
+              <button type="button" data-copy="curl -X POST https://SEU-DOMINIO/v1/signup -H 'content-type: application/json' -d '{&quot;email&quot;:&quot;voce@exemplo.com.br&quot;}'">Copiar</button>
+<pre>curl -X POST https://SEU-DOMINIO/v1/signup <span class="flag">\
+  -H</span> <span class="str">'content-type: application/json'</span> <span class="flag">\
+  -d</span> <span class="str">'{"email":"voce@exemplo.com.br"}'</span></pre>
+            </div>
+            <p>Chega um código de oito caracteres por e-mail. Vale 30 minutos.</p>
+          </div>
+        </li>
+        <li>
+          <div>
+            <h3>Confirme e receba a chave</h3>
+            <div class="cmd">
+              <button type="button" data-copy="curl -X POST https://SEU-DOMINIO/v1/signup/verify -H 'content-type: application/json' -d '{&quot;email&quot;:&quot;voce@exemplo.com.br&quot;,&quot;code&quot;:&quot;ABCD2345&quot;}'">Copiar</button>
+<pre>curl -X POST https://SEU-DOMINIO/v1/signup/verify <span class="flag">\
+  -H</span> <span class="str">'content-type: application/json'</span> <span class="flag">\
+  -d</span> <span class="str">'{"email":"voce@exemplo.com.br","code":"ABCD2345"}'</span></pre>
+            </div>
+            <p>A chave vem nessa resposta e <strong>só nessa</strong> — o que fica guardado aqui é
+              o hash dela. Se perder, <span style="font-family:var(--machine);font-size:0.9375em">POST /v1/keys/recover</span>
+              emite outra pelo mesmo e-mail, preservando plano e cota.</p>
+          </div>
+        </li>
+      </ol>
+    </section>
+
+    <section>
+      <h2>O que isto não faz</h2>
+      <p class="note">Os limites estão aqui porque descobri-los depois de integrar custa mais caro
+        do que ler agora.</p>
+
+      <dl class="limits">
+        <div>
+          <dt>Não consulta a Receita</dt>
+          <dd>CPF e CNPJ são validados por formato e dígito verificador. Situação cadastral exige outra fonte.</dd>
+        </div>
+        <div>
+          <dt>Não emite boleto</dt>
+          <dd>Lê, valida e converte. Gerar exige o campo livre de cada banco, com nosso número, agência e conta — isso é integração com o emissor.</dd>
+        </div>
+        <div>
+          <dt>Pix só estático</dt>
+          <dd>O dinâmico, com a cobrança atrás de uma URL, depende de um PSP. O decodificador lê os dois.</dd>
+        </div>
+        <div>
+          <dt>Não fala com banco</dt>
+          <dd>Nada aqui diz se um boleto está pago ou se uma chave Pix existe de verdade. São formatos, não liquidação.</dd>
+        </div>
+        <div>
+          <dt>Feriados federais</dt>
+          <dd>Estaduais e municipais não entram: são 5.570 calendários e manter isso correto é outro produto.</dd>
+        </div>
+      </dl>
+    </section>
+  </main>
+
+  <footer>
+    <p style="margin:0">Dados desta página gerados pelo próprio código do projeto. Se a conta não fechasse, a página não subiria.</p>
+    <nav>
+      <a href="/v1/openapi.json">OpenAPI 3.1</a>
+      <a href="/v1/health">Saúde</a>
+    </nav>
+  </footer>
+</div>
+
+<script>
+  // Troca de artefato: motion responde a clique, não ao scroll.
+  (function () {
+    var tabs = Array.prototype.slice.call(document.querySelectorAll('[role="tab"]'));
+    function select(tab) {
+      tabs.forEach(function (t) {
+        var panel = document.getElementById(t.getAttribute('aria-controls'));
+        var on = t === tab;
+        t.setAttribute('aria-selected', String(on));
+        t.tabIndex = on ? 0 : -1;
+        if (panel) panel.hidden = !on;
+      });
+    }
+    tabs.forEach(function (tab, i) {
+      tab.tabIndex = tab.getAttribute('aria-selected') === 'true' ? 0 : -1;
+      tab.addEventListener('click', function () { select(tab); });
+      tab.addEventListener('keydown', function (e) {
+        var step = e.key === 'ArrowRight' ? 1 : e.key === 'ArrowLeft' ? -1 : 0;
+        if (!step) return;
+        e.preventDefault();
+        var next = tabs[(i + step + tabs.length) % tabs.length];
+        select(next);
+        next.focus();
+      });
+    });
+  })();
+
+  // O comando copiado tem de funcionar colado: troca o placeholder pelo
+  // domínio de onde a página foi servida, no texto visível e no que é copiado.
+  (function () {
+    var host = location.origin;
+    if (/^https?:\/\/(localhost|127\.|\[::1\])/.test(host)) return; // em dev, mantém o placeholder
+    document.querySelectorAll('.cmd pre, [data-copy]').forEach(function (node) {
+      if (node.hasAttribute && node.hasAttribute('data-copy')) {
+        node.setAttribute('data-copy', node.getAttribute('data-copy').replace(/https:\/\/SEU-DOMINIO/g, host));
+      } else {
+        node.innerHTML = node.innerHTML.replace(/https:\/\/SEU-DOMINIO/g, host);
+      }
+    });
+  })();
+
+  // Copiar comando: o botão diz o que aconteceu, no mesmo verbo.
+  document.querySelectorAll('[data-copy]').forEach(function (button) {
+    button.addEventListener('click', function () {
+      navigator.clipboard.writeText(button.getAttribute('data-copy')).then(
+        function () {
+          button.textContent = 'Copiado';
+          setTimeout(function () { button.textContent = 'Copiar'; }, 2000);
+        },
+        function () { button.textContent = 'Selecione e copie'; }
+      );
+    });
+  });
+</script>
+</body>
+</html>

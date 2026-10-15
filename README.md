@@ -66,6 +66,17 @@ Decisões que valem saber:
 - **Limites da rota pública:** 5 pedidos por minuto por IP e 2 por minuto por e-mail (para o cadastro não servir de ferramenta para inundar a caixa de alguém); 10 verificações por minuto por IP.
 - Envio pelo **Resend** (`POST /emails`, sem SDK). Sem `RESEND_API_KEY` e `EMAIL_FROM`, as duas rotas respondem 503 — inclusive a de verificação, porque devolver "código inválido" a quem nunca pôde receber um código seria enganoso.
 
+## Landing page
+
+`index.html` na raiz é a página pública, servida pela Vercel como estático (as funções ficam sob `api/`). Sem framework, sem build: um arquivo com CSS e um punhado de JS embutidos.
+
+Duas decisões que vale conhecer antes de mexer:
+
+- **Os dados da página foram gerados pelo código do projeto.** A linha digitável do exemplo é um boleto válido de verdade (DV geral por módulo 11, DVs de campo por módulo 10), o BR Code tem CRC conferido, o CNPJ alfanumérico é o exemplo oficial da Receita. Se for trocar algum, gere com `lib/boleto.ts` / `lib/pix.ts` em vez de inventar — a página não deve conseguir mentir.
+- **As fontes vêm do Google Fonts** (Chivo e Azeret Mono), que é a única dependência externa da página. Se isso incomodar, dá para hospedar os `woff2` no próprio domínio; o desenho degrada para as fontes do sistema sem quebrar.
+
+O comando `curl` mostrado troca o placeholder pelo domínio de onde a página foi servida, para funcionar colado. Em `localhost` o placeholder é mantido.
+
 ## Documentação OpenAPI
 
 `GET /v1/openapi.json` devolve a especificação OpenAPI 3.1 de todos os endpoints. Pública de propósito: a documentação precisa ser legível por quem ainda não tem chave.
@@ -269,18 +280,20 @@ Lista mantida em ordem de prioridade. O que está em "verificação externa" nã
    - se `DUNNING_RECEIVED` significa de fato dinheiro creditado (foi inferido da descrição "payment received");
    - se `PUT /subscriptions` com `updatePendingPayments: true` realmente altera o valor da cobrança pendente.
 2. **Ler um QR Pix gerado aqui num app de banco de verdade.** O formato está conferido contra a especificação do BACEN e o CRC contra dois vetores independentes, mas nenhum QR foi escaneado. Usar valor baixo.
-3. **Enviar um e-mail de verdade pelo Resend.** O cliente está conferido na documentação, mas nenhum e-mail saiu. Exige domínio verificado na conta.
-4. **Conferir um boleto real.** Os algoritmos batem com os exemplos resolvidos da FEBRABAN e com um par código de barras/linha digitável de terceiro; falta passar uma linha digitável de boleto recebido de verdade.
+3. **Confirmar que o `index.html` da raiz é servido em `/` no deploy.** A documentação da Vercel não é explícita para projetos sem framework que também têm `api/`; se não for, basta um `outputDirectory` ou mover o arquivo.
+4. **Enviar um e-mail de verdade pelo Resend.** O cliente está conferido na documentação, mas nenhum e-mail saiu. Exige domínio verificado na conta.
+5. **Conferir um boleto real.** Os algoritmos batem com os exemplos resolvidos da FEBRABAN e com um par código de barras/linha digitável de terceiro; falta passar uma linha digitável de boleto recebido de verdade.
 
 ### Produto
 
-4. **Landing page**, com um renderizador do `/v1/openapi.json` embutido. Decidir aí se vale trazer um script de CDN para o projeto.
-5. **Revisar planos e preços** em `lib/plans.ts`, hoje provisórios, depois de medir custo real.
+4. **Renderizador do OpenAPI na própria página**, se valer trazer um script de CDN (Scalar, Redoc) para o projeto. Hoje a landing só aponta para o `/v1/openapi.json` cru.
+5. **Cadastro pela página**, com campo de e-mail e de código chamando `/v1/signup`. Hoje a conversão é copiar um `curl`, o que serve ao público de desenvolvedor mas exclui quem só quer testar.
+6. **Revisar planos e preços** em `lib/plans.ts`, hoje provisórios, depois de medir custo real.
 
 ### Técnico
 
-6. **Carência na rotação**, se a troca sem janela se mostrar incômoda na prática: aceitar o segredo anterior por alguns minutos.
-7. **Reconciliação ativa**, por rotina agendada, em vez de só no `GET /v1/billing`. Hoje a autocura depende de o cliente consultar o status.
-8. **Paginação nas consultas ao Asaas.** O limite de 100 por página cobre mais de 8 anos de assinatura mensal, mas não é infinito.
-9. **HTML → PDF e screenshot.** Precisa de Chromium headless: avaliar a Vercel com build compacto ou uma VPS pequena. É projeto, não tarefa.
-10. **Créditos pré-pagos**, necessários antes de qualquer endpoint com IA. O gancho já existe em `withApi(handler, { cost: N })`.
+7. **Carência na rotação**, se a troca sem janela se mostrar incômoda na prática: aceitar o segredo anterior por alguns minutos.
+8. **Reconciliação ativa**, por rotina agendada, em vez de só no `GET /v1/billing`. Hoje a autocura depende de o cliente consultar o status.
+9. **Paginação nas consultas ao Asaas.** O limite de 100 por página cobre mais de 8 anos de assinatura mensal, mas não é infinito.
+10. **HTML → PDF e screenshot.** Precisa de Chromium headless: avaliar a Vercel com build compacto ou uma VPS pequena. É projeto, não tarefa.
+11. **Créditos pré-pagos**, necessários antes de qualquer endpoint com IA. O gancho já existe em `withApi(handler, { cost: N })`.

@@ -11,3 +11,6 @@ node_modules/
 npm-debug.log*
 
 .DS_Store
+
+# Configuração local de ferramentas (preview, agentes)
+.claude/
