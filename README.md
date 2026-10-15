@@ -11,6 +11,8 @@ Plataforma comum (chave de API, limite por minuto, cota mensal, medição e cobr
 | `GET /v1/qr/codes?id=...` | Destino e contagem de leituras |
 | `PATCH /v1/qr/codes?id=...` `{ "url": "https://..." }` | Troca o destino sem mudar a imagem |
 | `GET /r/:id` | Redirecionamento público (302) e contagem de leituras |
+| `POST /v1/pix/qr` `{ "key", "name", "city", "amount?", "txid?" }` | BR Code do Pix ("copia e cola") estático + imagem PNG |
+| `POST /v1/pix/decode` `{ "br_code": "000201..." }` | Abre um BR Code: confere o CRC e devolve chave, beneficiário, valor e txid |
 | `GET` ou `POST /v1/validate/cnpj` | Valida CNPJ numérico e alfanumérico (módulo 11, ASCII − 48) |
 | `POST /v1/validate/cpf` `{ "value": "..." }` | Valida CPF (só por POST: é dado pessoal e query string vai para logs) |
 | `GET /v1/holidays?year=2026` | Feriados nacionais e pontos facultativos federais |
@@ -76,6 +78,10 @@ Atenção: o Asaas pode pausar a fila do webhook depois de 15 falhas seguidas. O
 ## Outros limites conhecidos
 
 - Validação de CPF/CNPJ é só de formato e dígito verificador, não consulta situação cadastral na Receita.
+- Pix: só gera BR Code **estático**. O dinâmico (com a cobrança atrás de uma URL) exige integração com um PSP; o decodificador reconhece e lê os dois.
+- Pix: a chave é validada no formato e no tipo (CPF/CNPJ pelo dígito verificador, UUID, e-mail, telefone), mas **não se ela existe de verdade** — isso exigiria consultar o DICT. Chave bem formada e não registrada gera um QR que só falha na hora do pagamento.
+- Pix: geração totalmente offline, sem falar com banco nem PSP. Não há conciliação nem confirmação de pagamento: o BR Code é só a instrução de cobrança.
+- Pix: o CRC e o formato foram conferidos contra o payload de exemplo do BACEN e contra o valor canônico do CRC-16/CCITT-FALSE, mas **nenhum QR gerado aqui foi lido por um app de banco real ainda**. Vale testar com um valor baixo antes de usar em produção.
 - Feriados: só federais. Estaduais e municipais ficam para uma próxima versão.
 - QR dinâmico é um redirecionador: um serviço assim pode ser usado para phishing. Antes de abrir ao público, adicione termos de uso, denúncia de links e (idealmente) verificação do destino contra listas de URLs maliciosas.
 - A rota pública `/r/:id` é limitada a 60 leituras por minuto por IP (ver abaixo). O limite é por janela fixa de um minuto, então dois picos na virada podem somar até 2× — contém abuso, não é cota precisa.
@@ -129,6 +135,7 @@ lib/
   store.ts      Redis (Upstash) com fallback em memória
   plans.ts      planos, preços e limites
   validators.ts CPF e CNPJ (numérico e alfanumérico)
+  pix.ts        BR Code do Pix (EMV/BACEN): monta, decodifica e CRC-16
   holidays.ts   feriados nacionais e dias úteis
   qr.ts         QR dinâmico
 scripts/create-key.ts
