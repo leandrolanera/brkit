@@ -14,6 +14,7 @@ Plataforma comum (chave de API, limite por minuto, cota mensal, medição e cobr
 | `POST /v1/pix/qr` `{ "key", "name", "city", "amount?", "txid?" }` | BR Code do Pix ("copia e cola") estático + imagem PNG |
 | `POST /v1/pix/decode` `{ "br_code": "000201..." }` | Abre um BR Code: confere o CRC e devolve chave, beneficiário, valor e txid |
 | `POST /v1/boleto/decode` `{ "code": "00190.50095 ..." }` | Valida linha digitável (47/48) ou código de barras (44), converte entre as duas e extrai banco, valor e vencimento |
+| `POST /v1/payments/decode` `{ "code": "..." }` | Aceita Pix, linha digitável ou código de barras sem saber o formato antes; devolve envelope comum + decodificação nativa |
 | `GET` ou `POST /v1/validate/cnpj` | Valida CNPJ numérico e alfanumérico (módulo 11, ASCII − 48) |
 | `POST /v1/validate/cpf` `{ "value": "..." }` | Valida CPF (só por POST: é dado pessoal e query string vai para logs) |
 | `GET /v1/holidays?year=2026` | Feriados nacionais e pontos facultativos federais |
@@ -40,6 +41,7 @@ Cada endpoint resolve um problema concreto. A especificação em `/v1/openapi.js
 
 | Situação | Endpoint |
 |---|---|
+| Campo único de "código de pagamento" no app, ou leitor de câmera que tanto lê QR de Pix quanto código de barras — sem ramificar no cliente antes de saber o formato | `POST /v1/payments/decode` |
 | Cobrar no checkout, por WhatsApp ou numa fatura, com o número do pedido voltando no extrato do PSP | `POST /v1/pix/qr` |
 | Conferir o código que o cliente colou antes de dar baixa, ou casar um Pix recebido com o pedido pelo `txid` | `POST /v1/pix/decode` |
 | Dar baixa em boleto enviado por e-mail sem digitar valor e vencimento à mão | `POST /v1/boleto/decode` |
@@ -285,6 +287,7 @@ lib/
   validators.ts CPF e CNPJ (numérico e alfanumérico)
   pix.ts        BR Code do Pix (EMV/BACEN): monta, decodifica e CRC-16
   boleto.ts     linha digitável e código de barras (cobrança e arrecadação)
+  payments.ts   identifica o formato e decodifica (compõe pix.ts e boleto.ts)
   signup.ts     cadastro público: código de verificação e emissão da chave
   email.ts      envio transacional pelo Resend (sem dependências)
   holidays.ts   feriados nacionais e dias úteis

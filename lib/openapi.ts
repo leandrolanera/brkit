@@ -1,4 +1,5 @@
 import { cobrancaBarcodeToLine, decodeBoleto, mod11Cobranca } from "./boleto.js";
+import { decodePayment } from "./payments.js";
 import { holidaysForYear } from "./holidays.js";
 import { buildBrCode, LIMITS as PIX_LIMITS, parseBrCode } from "./pix.js";
 import { PLANS, type PlanId } from "./plans.js";
@@ -129,6 +130,7 @@ export function buildOpenApiDocument(serverUrl?: string): Json {
       { name: "QR Code", description: "QR Code estático e dinâmico" },
       { name: "Pix", description: "BR Code do Pix (copia e cola)" },
       { name: "Boleto", description: "Linha digitável e código de barras" },
+      { name: "Pagamentos", description: "Qualquer código de pagamento, sem saber o formato antes" },
       { name: "Validação", description: "CPF e CNPJ" },
       { name: "Feriados", description: "Feriados nacionais e dias úteis" },
       { name: "Chaves", description: "Cadastro, rotação e recuperação" },
@@ -367,6 +369,44 @@ export function buildOpenApiDocument(serverUrl?: string): Json {
               cobranca: ex("Boleto de cobrança bancária", BOLETO_EXAMPLE.decoded),
             }),
             "400": errorResponse("Comprimento incompatível", "invalid_body", "invalid_length"),
+            ...meteredErrors(),
+          },
+        },
+      },
+
+      // --- Pagamentos ----------------------------------------------------
+      "/v1/payments/decode": {
+        post: {
+          tags: ["Pagamentos"],
+          operationId: "decodePayment",
+          summary: "Decodifica qualquer código de pagamento",
+          description:
+            "Aceita Pix copia e cola, linha digitável ou código de barras, identifica o formato " +
+            "sozinho e devolve um envelope comum — valor, vencimento, beneficiário — mais a " +
+            "decodificação completa do formato em `details`.\n\n" +
+            "**Quando usar:** quando o usuário cola algo e você ainda não sabe o que é. Um campo " +
+            "único de \"código de pagamento\" no seu app, conciliação de comprovantes que chegam " +
+            "misturados, ou leitor de câmera que tanto lê QR de Pix quanto código de barras de " +
+            "boleto. Evita ramificar no cliente antes de saber o formato.\n\n" +
+            "Se já souber o formato, as rotas específicas (`/v1/pix/decode`, `/v1/boleto/decode`) " +
+            "devolvem o mesmo conteúdo sem o envelope.",
+          requestBody: jsonBody(
+            {
+              type: "object",
+              required: ["code"],
+              properties: { code: { type: "string", maxLength: 1024, description: "O que o usuário colou, como veio." } },
+            },
+            {
+              pix: ex("Pix copia e cola", { code: PIX_EXAMPLE.brCode }),
+              boleto: ex("Linha digitável de boleto", { code: BOLETO_EXAMPLE.line }),
+            },
+          ),
+          responses: {
+            "200": jsonResponse("Formato identificado e campos lidos.", { $ref: "#/components/schemas/PaymentDecoded" }, {
+              pix: ex("Reconhecido como Pix", decodePayment(PIX_EXAMPLE.brCode)),
+              boleto: ex("Reconhecido como boleto de cobrança", decodePayment(BOLETO_EXAMPLE.line)),
+            }),
+            "400": errorResponse("Conteúdo irreconhecível", "invalid_body", "unrecognized_code"),
             ...meteredErrors(),
           },
         },
@@ -884,6 +924,34 @@ export function buildOpenApiDocument(serverUrl?: string): Json {
             company_id: { type: "string" },
             free_field: { type: "string" },
             due_date: { type: ["string", "null"], format: "date", description: "Só quando a empresa usa as 8 primeiras posições do campo livre como AAAAMMDD." },
+          },
+        },
+
+        PaymentDecoded: {
+          type: "object",
+          description:
+            "Envelope comum a todos os formatos. Os campos que só existem em um deles ficam em " +
+            "`details`, com o formato nativo da rota específica.",
+          properties: {
+            kind: { type: "string", enum: ["pix", "boleto_cobranca", "boleto_arrecadacao"] },
+            valid: { type: "boolean", description: "CRC do Pix ou dígitos verificadores do boleto conferem." },
+            amount: { type: ["number", "null"], description: "Reais, ou null quando o código não fixa valor." },
+            due_date: { type: ["string", "null"], format: "date", description: "Pix estático não carrega vencimento." },
+            merchant_name: {
+              type: ["string", "null"],
+              description:
+                "Só o Pix traz o nome de quem recebe. No boleto o beneficiário vive no campo livre, " +
+                "que segue regras de cada banco — ali dá para saber o banco cobrador, em `details`.",
+            },
+            errors: { type: "array", items: { type: "string" } },
+            details: {
+              description: "A decodificação completa, no formato da rota específica.",
+              oneOf: [
+                { $ref: "#/components/schemas/PixDecoded" },
+                { $ref: "#/components/schemas/BoletoCobranca" },
+                { $ref: "#/components/schemas/BoletoArrecadacao" },
+              ],
+            },
           },
         },
 
