@@ -1,5 +1,8 @@
-import { LIMITS as PIX_LIMITS } from "./pix.js";
+import { cobrancaBarcodeToLine, decodeBoleto, mod11Cobranca } from "./boleto.js";
+import { holidaysForYear } from "./holidays.js";
+import { buildBrCode, LIMITS as PIX_LIMITS, parseBrCode } from "./pix.js";
 import { PLANS, type PlanId } from "./plans.js";
+import { cnpjKind, formatCnpj, formatCpf, normalizeCnpj, normalizeCpf } from "./validators.js";
 
 /**
  * Especificação OpenAPI 3.1 do portfólio.
@@ -14,6 +17,37 @@ import { PLANS, type PlanId } from "./plans.js";
 type Json = Record<string, unknown>;
 
 const PLAN_IDS: PlanId[] = ["free", "pro", "scale"];
+
+// ---------------------------------------------------------------------------
+// Exemplos da especificação, produzidos pelas MESMAS funções que os endpoints
+// usam. Exemplo errado na documentação custa caro: quem lê copia, não funciona,
+// e passa a desconfiar do resto. Assim não existe exemplo que não feche — e há
+// teste conferindo que cada um continua válido.
+
+const PIX_EXAMPLE = (() => {
+  const brCode = buildBrCode({
+    key: "contato@livrariasaojorge.com.br",
+    name: "Livraria Sao Jorge",
+    city: "Sao Paulo",
+    amount: 89.9,
+    txid: "PEDIDO4471",
+  });
+  return { brCode, decoded: parseBrCode(brCode) };
+})();
+
+const BOLETO_EXAMPLE = (() => {
+  // Vencimento a ~30 dias da virada do fator, para o exemplo não nascer vencido.
+  const dueDays = 1636;
+  const semDv = `0019X${dueDays}0000124790` + "0000000012345678901234567".slice(0, 25);
+  const dv = mod11Cobranca(semDv.slice(0, 4) + semDv.slice(5));
+  const barcode = `0019${dv}${dueDays}0000124790` + "0000000012345678901234567".slice(0, 25);
+  const line = cobrancaBarcodeToLine(barcode);
+  return { barcode, line, decoded: decodeBoleto(line) };
+})();
+
+const CPF_EXAMPLE = "529.982.247-25";
+const CNPJ_EXAMPLE = "12.ABC.345/01DE-35";
+const HOLIDAYS_EXAMPLE_YEAR = 2026;
 
 /** Tabela de planos para a descrição, derivada de lib/plans.ts. */
 const planTable = PLAN_IDS.map((id) => {
@@ -65,15 +99,18 @@ const meteredErrors = (): Json => ({
   ...authErrors(),
 });
 
-const jsonBody = (schema: Json, required = true): Json => ({
+const jsonBody = (schema: Json, examples?: Json, required = true): Json => ({
   required,
-  content: { "application/json": { schema } },
+  content: { "application/json": { schema, ...(examples ? { examples } : {}) } },
 });
 
-const jsonResponse = (description: string, schema: Json): Json => ({
+const jsonResponse = (description: string, schema: Json, examples?: Json): Json => ({
   description,
-  content: { "application/json": { schema } },
+  content: { "application/json": { schema, ...(examples ? { examples } : {}) } },
 });
+
+/** Um exemplo nomeado, do jeito que o OpenAPI espera. */
+const ex = (summary: string, value: unknown): Json => ({ summary, value });
 
 /** Rotas públicas sobrescrevem o `security` global com uma lista vazia. */
 const PUBLIC = { security: [] as unknown[] };
@@ -106,7 +143,10 @@ export function buildOpenApiDocument(serverUrl?: string): Json {
           tags: ["QR Code"],
           operationId: "getStaticQr",
           summary: "QR Code estático",
-          description: "Gera a imagem de um QR Code com o conteúdo informado. Nada é armazenado.",
+          description:
+            "Gera a imagem de um QR Code com o conteúdo informado. Nada é armazenado.\n\n" +
+            "**Quando usar:** imprimir um QR num cartaz, etiqueta, crachá ou cardápio com conteúdo " +
+            "que não muda. Se o destino puder mudar depois de impresso, use o QR dinâmico.",
           parameters: [
             { name: "data", in: "query", required: true, schema: { type: "string", maxLength: 1000 }, description: "Conteúdo do QR Code." },
             { name: "format", in: "query", schema: { type: "string", enum: ["png", "svg"], default: "png" } },
@@ -132,14 +172,28 @@ export function buildOpenApiDocument(serverUrl?: string): Json {
           summary: "Cria QR Code dinâmico",
           description:
             "Cria um QR Code cujo destino pode ser trocado depois, sem reimprimir a imagem. " +
-            "A imagem aponta para um link curto `/r/{id}`, que também conta as leituras.",
-          requestBody: jsonBody({
-            type: "object",
-            required: ["url"],
-            properties: { url: { type: "string", format: "uri", maxLength: 2048, description: "Destino http(s) público." } },
-          }),
+            "A imagem aponta para um link curto `/r/{id}`, que também conta as leituras.\n\n" +
+            "**Quando usar:** material impresso cujo destino pode mudar — cardápio de restaurante, " +
+            "cartaz de campanha, etiqueta de produto, placa de vitrine. Troque o destino quando o " +
+            "cardápio mudar de link ou a promoção acabar, sem reimprimir nada, e acompanhe quantas " +
+            "leituras cada peça teve.",
+          requestBody: jsonBody(
+            {
+              type: "object",
+              required: ["url"],
+              properties: { url: { type: "string", format: "uri", maxLength: 2048, description: "Destino http(s) público." } },
+            },
+            { cardapio: ex("Cardápio de restaurante", { url: "https://livrariasaojorge.com.br/cardapio" }) },
+          ),
           responses: {
-            "201": jsonResponse("QR Code criado.", { $ref: "#/components/schemas/DynamicQrCreated" }),
+            "201": jsonResponse("QR Code criado.", { $ref: "#/components/schemas/DynamicQrCreated" }, {
+              cardapio: ex("Resposta da criação acima", {
+                id: "k3Dm9Qz",
+                short_url: "https://SEU-DOMINIO/r/k3Dm9Qz",
+                target_url: "https://livrariasaojorge.com.br/cardapio",
+                image_data_url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg… (PNG completo, encurtado aqui)",
+              }),
+            }),
             "400": errorResponse("URL inválida", "invalid_url"),
             ...meteredErrors(),
           },
@@ -205,7 +259,10 @@ export function buildOpenApiDocument(serverUrl?: string): Json {
           summary: "Gera BR Code do Pix",
           description:
             "Monta o payload do Pix copia e cola (padrão EMV do BACEN) e a imagem em PNG. " +
-            "Totalmente offline: não fala com banco nem PSP. Só gera código **estático**.",
+            "Totalmente offline: não fala com banco nem PSP. Só gera código **estático**.\n\n" +
+            "**Quando usar:** cobrar no checkout do seu site, mandar cobrança por WhatsApp ou e-mail, " +
+            "ou imprimir numa fatura. O `txid` que você enviar aparece no extrato do seu PSP, então " +
+            "use o número do pedido ali para casar o pagamento com a venda sem conferência manual.",
           requestBody: jsonBody({
             type: "object",
             required: ["key", "name", "city"],
@@ -218,9 +275,28 @@ export function buildOpenApiDocument(serverUrl?: string): Json {
               description: { type: "string", description: "Informação adicional. O campo 26 inteiro não passa de 99 caracteres, então o espaço depende do tamanho da chave." },
               reusable: { type: "boolean", default: true, description: "false marca o código como de uso único." },
             },
+          }, {
+            pedido: ex("Cobrança de um pedido", {
+              key: "contato@livrariasaojorge.com.br",
+              name: "Livraria Sao Jorge",
+              city: "Sao Paulo",
+              amount: 89.9,
+              txid: "PEDIDO4471",
+            }),
+            semValor: ex("Doação, com o pagador escolhendo o valor", {
+              key: "12.345.678/0001-95",
+              name: "Instituto Semear",
+              city: "Recife",
+            }),
           }),
           responses: {
-            "201": jsonResponse("BR Code e imagem.", { $ref: "#/components/schemas/PixBrCode" }),
+            "201": jsonResponse("BR Code e imagem.", { $ref: "#/components/schemas/PixBrCode" }, {
+              pedido: ex("Resposta da cobrança acima", {
+                br_code: PIX_EXAMPLE.brCode,
+                key_type: "email",
+                image_data_url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg… (PNG completo, encurtado aqui)",
+              }),
+            }),
             "400": errorResponse("Entrada fora da especificação", "invalid_body", "missing_fields", "invalid_key", "invalid_name", "invalid_city", "invalid_amount", "invalid_txid", "invalid_reusable", "fields_too_long"),
             ...meteredErrors(),
           },
@@ -234,14 +310,22 @@ export function buildOpenApiDocument(serverUrl?: string): Json {
           summary: "Decodifica um BR Code",
           description:
             "Confere o CRC e devolve os campos. Payload bem formado com CRC errado responde 200 " +
-            "com `valid: false` e o que deu para ler — quem depura precisa ver os campos.",
-          requestBody: jsonBody({
-            type: "object",
-            required: ["br_code"],
-            properties: { br_code: { type: "string", maxLength: 1024 } },
-          }),
+            "com `valid: false` e o que deu para ler — quem depura precisa ver os campos.\n\n" +
+            "**Quando usar:** conferir um código que o cliente colou antes de dar baixa, extrair o " +
+            "`txid` de um Pix recebido para casar com o pedido, ou validar no seu app que o código " +
+            "escaneado é íntegro antes de mandar o usuário pagar.",
+          requestBody: jsonBody(
+            {
+              type: "object",
+              required: ["br_code"],
+              properties: { br_code: { type: "string", maxLength: 1024 } },
+            },
+            { recebido: ex("Código colado pelo cliente", { br_code: PIX_EXAMPLE.brCode }) },
+          ),
           responses: {
-            "200": jsonResponse("Campos lidos do BR Code.", { $ref: "#/components/schemas/PixDecoded" }),
+            "200": jsonResponse("Campos lidos do BR Code.", { $ref: "#/components/schemas/PixDecoded" }, {
+              recebido: ex("Código íntegro", PIX_EXAMPLE.decoded),
+            }),
             "400": errorResponse("Não é um BR Code", "invalid_body", "malformed_br_code"),
             ...meteredErrors(),
           },
@@ -257,16 +341,30 @@ export function buildOpenApiDocument(serverUrl?: string): Json {
           description:
             "Aceita linha digitável (47 dígitos na cobrança, 48 na arrecadação) ou código de barras (44), " +
             "com ou sem pontuação, e identifica o formato sozinho. Devolve as duas representações, então " +
-            "serve de conversor. Valida estrutura e dígitos verificadores; **não** diz se o boleto está pago.",
-          requestBody: jsonBody({
-            type: "object",
-            required: ["code"],
-            properties: { code: { type: "string", maxLength: 128 } },
-          }),
+            "serve de conversor. Valida estrutura e dígitos verificadores; **não** diz se o boleto está pago.\n\n" +
+            "**Quando usar:** dar baixa em boleto que o cliente mandou por e-mail, extraindo valor e " +
+            "vencimento sem digitação; validar o código num formulário antes de enviar ao banco, porque " +
+            "código errado volta rejeitado e vira chamado de suporte; ou converter o que o leitor de " +
+            "código de barras capturou em linha digitável para conferência humana.\n\n" +
+            "Atenção ao `due_date_ambiguous`: o fator de vencimento reiniciou em fevereiro de 2025 e " +
+            "todo fator passou a mapear duas datas possíveis.",
+          requestBody: jsonBody(
+            {
+              type: "object",
+              required: ["code"],
+              properties: { code: { type: "string", maxLength: 128 } },
+            },
+            {
+              linha: ex("Linha digitável, como o cliente envia", { code: BOLETO_EXAMPLE.line }),
+              barras: ex("Código de barras, como o leitor captura", { code: BOLETO_EXAMPLE.barcode }),
+            },
+          ),
           responses: {
             "200": jsonResponse("Campos do boleto.", {
               oneOf: [{ $ref: "#/components/schemas/BoletoCobranca" }, { $ref: "#/components/schemas/BoletoArrecadacao" }],
               discriminator: { propertyName: "kind" },
+            }, {
+              cobranca: ex("Boleto de cobrança bancária", BOLETO_EXAMPLE.decoded),
             }),
             "400": errorResponse("Comprimento incompatível", "invalid_body", "invalid_length"),
             ...meteredErrors(),
@@ -280,10 +378,24 @@ export function buildOpenApiDocument(serverUrl?: string): Json {
           tags: ["Validação"],
           operationId: "validateCnpjByQuery",
           summary: "Valida CNPJ",
-          description: "Aceita numérico e alfanumérico. Valida formato e dígitos verificadores; não consulta a Receita.",
+          description:
+            "Aceita numérico e alfanumérico. Valida formato e dígitos verificadores; não consulta a Receita.\n\n" +
+            "**Quando usar:** barrar erro de digitação no cadastro antes de gravar, e conferir base " +
+            "importada em lote.\n\n" +
+            "**Atenção ao CNPJ alfanumérico**, em vigor desde julho de 2026: expressões regulares " +
+            "antigas que só aceitam dígitos passam a recusar empresa válida, e o cálculo do dígito " +
+            "mudou (cada caractere vale o código ASCII menos 48).",
           parameters: [{ name: "value", in: "query", required: true, schema: { type: "string", maxLength: 32 } }],
           responses: {
-            "200": jsonResponse("Resultado da validação.", { $ref: "#/components/schemas/CnpjResult" }),
+            "200": jsonResponse("Resultado da validação.", { $ref: "#/components/schemas/CnpjResult" }, {
+              alfanumerico: ex("CNPJ alfanumérico", {
+                valid: true,
+                kind: cnpjKind(CNPJ_EXAMPLE),
+                normalized: normalizeCnpj(CNPJ_EXAMPLE),
+                formatted: formatCnpj(CNPJ_EXAMPLE),
+              }),
+              recusado: ex("Dígito verificador errado", { valid: false, kind: null, normalized: null, formatted: null }),
+            }),
             "400": errorResponse("Valor ausente ou longo demais", "missing_value"),
             ...meteredErrors(),
           },
@@ -308,10 +420,21 @@ export function buildOpenApiDocument(serverUrl?: string): Json {
           summary: "Valida CPF",
           description:
             "Só por POST: CPF é dado pessoal e query string vai para log de acesso. Nada é armazenado. " +
-            "Valida formato e dígitos verificadores; não consulta a Receita.",
-          requestBody: jsonBody({ type: "object", required: ["value"], properties: { value: { type: "string", maxLength: 32 } } }),
+            "Valida formato e dígitos verificadores; não consulta a Receita.\n\n" +
+            "**Quando usar:** conferir o CPF no cadastro antes de gravar, evitando base suja e cobrança " +
+            "que não casa com o pagador.",
+          requestBody: jsonBody(
+            { type: "object", required: ["value"], properties: { value: { type: "string", maxLength: 32 } } },
+            { cadastro: ex("CPF digitado no cadastro", { value: CPF_EXAMPLE }) },
+          ),
           responses: {
-            "200": jsonResponse("Resultado da validação.", { $ref: "#/components/schemas/CpfResult" }),
+            "200": jsonResponse("Resultado da validação.", { $ref: "#/components/schemas/CpfResult" }, {
+              aceito: ex("CPF válido", {
+                valid: true,
+                normalized: normalizeCpf(CPF_EXAMPLE),
+                formatted: formatCpf(CPF_EXAMPLE),
+              }),
+            }),
             "400": errorResponse("Valor ausente ou longo demais", "invalid_body"),
             ...meteredErrors(),
           },
@@ -324,10 +447,20 @@ export function buildOpenApiDocument(serverUrl?: string): Json {
           tags: ["Feriados"],
           operationId: "listHolidays",
           summary: "Feriados do ano",
-          description: "Feriados nacionais e pontos facultativos federais. Estaduais e municipais não estão incluídos.",
+          description:
+            "Feriados nacionais e pontos facultativos federais. Estaduais e municipais não estão incluídos.\n\n" +
+            "**Quando usar:** montar o calendário de atendimento, bloquear agendamento em feriado, e " +
+            "decidir o que fazer com vencimento que cai em dia não útil. A Páscoa move Carnaval e " +
+            "Corpus Christi todo ano, então tabela fixa envelhece sozinha.",
           parameters: [{ name: "year", in: "query", schema: { type: "integer", minimum: 1970, maximum: 2100 }, description: "Padrão: ano atual em UTC." }],
           responses: {
-            "200": jsonResponse("Lista de feriados.", { $ref: "#/components/schemas/HolidaysResult" }),
+            "200": jsonResponse("Lista de feriados.", { $ref: "#/components/schemas/HolidaysResult" }, {
+              ano: ex(`Feriados de ${HOLIDAYS_EXAMPLE_YEAR}`, {
+                year: HOLIDAYS_EXAMPLE_YEAR,
+                scope: "national",
+                holidays: holidaysForYear(HOLIDAYS_EXAMPLE_YEAR),
+              }),
+            }),
             "400": errorResponse("Ano fora do intervalo", "invalid_year"),
             ...meteredErrors(),
           },
@@ -339,13 +472,27 @@ export function buildOpenApiDocument(serverUrl?: string): Json {
           tags: ["Feriados"],
           operationId: "countBusinessDays",
           summary: "Conta dias úteis",
-          description: "Exclui sábados, domingos e feriados nacionais. Intervalo máximo de 10 anos.",
+          description:
+            "Exclui sábados, domingos e feriados nacionais. Intervalo máximo de 10 anos.\n\n" +
+            "**Quando usar:** calcular prazo de entrega, SLA de atendimento, prazo processual ou " +
+            "vencimento contratual contado em dias úteis. A resposta traz quais feriados entraram na " +
+            "conta, o que serve para justificar o prazo ao cliente.",
           parameters: [
             { name: "from", in: "query", required: true, schema: { type: "string", format: "date" } },
             { name: "to", in: "query", required: true, schema: { type: "string", format: "date" } },
           ],
           responses: {
-            "200": jsonResponse("Contagem e feriados excluídos.", { $ref: "#/components/schemas/BusinessDaysResult" }),
+            "200": jsonResponse("Contagem e feriados excluídos.", { $ref: "#/components/schemas/BusinessDaysResult" }, {
+              prazo: ex("Prazo de entrega em novembro", {
+                from: "2026-11-01",
+                to: "2026-11-30",
+                total_days: 30,
+                business_days: 19,
+                holidays_excluded: holidaysForYear(2026).filter(
+                  (h) => h.type === "national" && h.date >= "2026-11-01" && h.date <= "2026-11-30",
+                ),
+              }),
+            }),
             "400": errorResponse("Datas inválidas ou intervalo longo demais", "invalid_date", "invalid_range", "range_too_long"),
             ...meteredErrors(),
           },
@@ -458,7 +605,12 @@ export function buildOpenApiDocument(serverUrl?: string): Json {
             "boleto ou cartão. O documento do pagador vai direto ao provedor e não é armazenado aqui. " +
             "Não consome cota.\n\nSe uma assinatura ativa já existir no provedor sem estar registrada aqui, " +
             "ela é adotada em vez de criar outra — é o que impede cobrança em dobro quando uma resposta se perde.",
-          requestBody: jsonBody({ $ref: "#/components/schemas/CheckoutRequest" }),
+          requestBody: jsonBody({ $ref: "#/components/schemas/CheckoutRequest" }, {
+            pro: ex("Contratar o plano pro", {
+              plan: "pro",
+              customer: { name: "Maria Souza", document: "529.982.247-25", email: "maria@exemplo.com.br" },
+            }),
+          }),
           responses: {
             "201": jsonResponse("Assinatura criada.", { $ref: "#/components/schemas/CheckoutResult" }),
             "400": errorResponse("Entrada inválida", "invalid_plan", "invalid_name", "invalid_email", "invalid_document"),

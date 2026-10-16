@@ -34,6 +34,27 @@ Plataforma comum (chave de API, limite por minuto, cota mensal, medição e cobr
 Autenticação: header `x-api-key: ak_live_...` ou `Authorization: Bearer ak_live_...`.
 Toda resposta autenticada traz `x-ratelimit-*` e `x-usage-*`. Erros seguem o formato `{ "error": { "code", "message" } }`.
 
+### Para que serve
+
+Cada endpoint resolve um problema concreto. A especificação em `/v1/openapi.json` traz, em cada operação, um bloco **"Quando usar"** e exemplos de requisição e resposta prontos para copiar.
+
+| Situação | Endpoint |
+|---|---|
+| Cobrar no checkout, por WhatsApp ou numa fatura, com o número do pedido voltando no extrato do PSP | `POST /v1/pix/qr` |
+| Conferir o código que o cliente colou antes de dar baixa, ou casar um Pix recebido com o pedido pelo `txid` | `POST /v1/pix/decode` |
+| Dar baixa em boleto enviado por e-mail sem digitar valor e vencimento à mão | `POST /v1/boleto/decode` |
+| Validar o código no formulário antes de mandar ao banco — código errado volta rejeitado e vira chamado de suporte | `POST /v1/boleto/decode` |
+| Converter o que o leitor de código de barras capturou em linha digitável | `POST /v1/boleto/decode` |
+| Barrar erro de digitação no cadastro antes de gravar, inclusive **CNPJ alfanumérico** | `GET /v1/validate/cnpj`, `POST /v1/validate/cpf` |
+| Cardápio, cartaz ou etiqueta cujo destino muda depois de impresso, com contagem de leituras | `POST /v1/qr/codes` |
+| Prazo de entrega, SLA ou vencimento contado em dias úteis, com os feriados que entraram na conta | `GET /v1/holidays/business-days` |
+| Bloquear agendamento em feriado, sem manter tabela que envelhece (Carnaval e Corpus Christi movem todo ano) | `GET /v1/holidays` |
+
+Dois argumentos que costumam decidir a compra, e que a documentação explica em detalhe:
+
+- **O CNPJ alfanumérico** está em vigor desde julho de 2026. Expressões regulares antigas que só aceitam dígitos passam a recusar empresa válida, e o cálculo do dígito mudou.
+- **O fator de vencimento do boleto** reiniciou em fevereiro de 2025, então todo fator mapeia duas datas possíveis. A resposta traz as duas leituras e sinaliza a ambiguidade, em vez de chutar.
+
 ### Regras da plataforma
 
 - O limite por minuto conta toda requisição autenticada, inclusive as que falham.
@@ -89,6 +110,8 @@ Para ler num navegador, aponte um renderizador para essa URL — [Scalar](https:
 O spec é **construído em TypeScript** (`lib/openapi.ts`), não escrito como JSON estático, porque documentação de API erra por desatualizar e um arquivo solto não tem como avisar. Daí:
 
 - Os limites documentados saem das mesmas constantes que o código aplica (`PLANS`, `LIMITS` do Pix). Mudar a cota muda a documentação.
+- **Os exemplos são gerados pelas mesmas funções que os endpoints usam.** O BR Code do exemplo é um Pix válido, a linha digitável tem todos os dígitos verificadores corretos, a lista de feriados é a que a API devolve. Exemplo errado na documentação custa caro: quem lê copia, não funciona, e passa a desconfiar do resto — então há teste decodificando cada um.
+- Cada endpoint de produto declara **"Quando usar"**, e há teste conferindo que nenhum entra sem isso.
 - Os testes conferem cobertura **nos dois sentidos**: toda rota exportada em `api/` precisa estar no spec, e todo caminho do spec precisa existir como rota. Endpoint novo sem documentação quebra a suíte, e documentação de rota removida também.
 - O webhook do Asaas é excluído de propósito (quem chama é o provedor, não clientes). A exclusão é uma lista explícita e testada: se a rota deixar de existir, o teste avisa que o motivo registrado ficou obsoleto.
 - Outras conferências: todo `$ref` resolve, nenhum schema fica órfão, `operationId` é único, rota pública declara `security: []` (sem isso a doc pediria chave de quem está tentando obtê-la), e endpoint que consome cota documenta o 402 — e quem não consome, não documenta.

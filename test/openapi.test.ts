@@ -2,8 +2,11 @@ import assert from "node:assert/strict";
 import { readdirSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
 import { afterEach, describe, test } from "node:test";
+import { decodeBoleto } from "../lib/boleto.js";
 import { buildOpenApiDocument } from "../lib/openapi.js";
+import { parseBrCode } from "../lib/pix.js";
 import { LIMITS as PIX_LIMITS } from "../lib/pix.js";
+import { holidaysForYear } from "../lib/holidays.js";
 import { PLANS } from "../lib/plans.js";
 import { GET as openapiEndpoint } from "../api/v1/openapi.js";
 import { withEnv } from "./helpers.js";
@@ -132,6 +135,111 @@ describe("limites documentados saem das constantes do código", () => {
     assert.equal(props["name"]?.maxLength, PIX_LIMITS.name);
     assert.equal(props["city"]?.maxLength, PIX_LIMITS.city);
     assert.equal(props["txid"]?.maxLength, PIX_LIMITS.txid);
+  });
+});
+
+describe("exemplos da documentação", () => {
+  /** Todos os exemplos nomeados do documento, com o caminho onde aparecem. */
+  function allExamples(): { onde: string; nome: string; valor: unknown }[] {
+    const found: { onde: string; nome: string; valor: unknown }[] = [];
+    function walk(node: unknown, path: string) {
+      if (Array.isArray(node)) return node.forEach((n, i) => walk(n, `${path}[${i}]`));
+      if (!node || typeof node !== "object") return;
+      for (const [k, v] of Object.entries(node)) {
+        if (k === "examples" && v && typeof v === "object") {
+          for (const [nome, corpo] of Object.entries(v as Record<string, { value?: unknown }>)) {
+            found.push({ onde: path, nome, valor: corpo?.value });
+          }
+        } else walk(v, `${path}/${k}`);
+      }
+    }
+    walk(doc, "");
+    return found;
+  }
+
+  test("os endpoints de produto dizem quando usar", () => {
+    // O "Quando usar" é o que transforma a referência em argumento de venda.
+    // Sem este teste, um endpoint novo entra sem ele e ninguém nota.
+    const produto = [
+      ["/v1/qr", "get"],
+      ["/v1/qr/codes", "post"],
+      ["/v1/pix/qr", "post"],
+      ["/v1/pix/decode", "post"],
+      ["/v1/boleto/decode", "post"],
+      ["/v1/validate/cnpj", "get"],
+      ["/v1/validate/cpf", "post"],
+      ["/v1/holidays", "get"],
+      ["/v1/holidays/business-days", "get"],
+    ] as const;
+
+    const faltando = produto.filter(([url, method]) => {
+      const op = paths[url]?.[method] as { description?: string } | undefined;
+      return !op?.description?.includes("**Quando usar:**");
+    });
+    assert.deepEqual(faltando.map(([u, m]) => `${m.toUpperCase()} ${u}`), []);
+  });
+
+  test("há exemplo de requisição e de resposta nos endpoints de produto", () => {
+    const comExemplo = allExamples().map((e) => e.onde);
+    for (const url of ["/v1/pix/qr", "/v1/pix/decode", "/v1/boleto/decode", "/v1/holidays"]) {
+      assert.ok(
+        comExemplo.some((onde) => onde.includes(url)),
+        `${url} deveria trazer exemplo: é o que o leitor copia para testar`,
+      );
+    }
+  });
+
+  test("o BR Code do exemplo é um Pix válido de verdade", () => {
+    // Exemplo errado na documentação custa caro: quem lê copia, não funciona, e
+    // passa a desconfiar do resto. Por isso eles são gerados pelo próprio código.
+    const pix = allExamples().filter((e) => e.onde.includes("/v1/pix"));
+    assert.ok(pix.length > 0);
+
+    for (const { nome, valor } of pix) {
+      const v = valor as Record<string, unknown>;
+      const brCode = typeof v["br_code"] === "string" ? v["br_code"] : null;
+      if (!brCode) continue;
+      const decoded = parseBrCode(brCode);
+      assert.equal(decoded?.crc_valid, true, `CRC do exemplo "${nome}" não fecha`);
+      assert.equal(decoded?.valid, true, `exemplo "${nome}" não é um BR Code completo`);
+    }
+  });
+
+  test("o boleto do exemplo tem todos os dígitos verificadores corretos", () => {
+    const boleto = allExamples().filter((e) => e.onde.includes("/v1/boleto"));
+    assert.ok(boleto.length > 0);
+
+    for (const { nome, valor } of boleto) {
+      const v = valor as Record<string, unknown>;
+      const code = (typeof v["code"] === "string" && v["code"]) ||
+        (typeof v["digitable_line"] === "string" && v["digitable_line"]) || null;
+      if (!code) continue;
+      const decoded = decodeBoleto(code);
+      assert.equal(decoded?.valid, true, `exemplo "${nome}" não é um boleto válido: ${JSON.stringify(decoded?.errors)}`);
+    }
+  });
+
+  test("a linha digitável e o código de barras do exemplo são o mesmo boleto", () => {
+    const porNome = new Map(allExamples().map((e) => [e.nome, e.valor as Record<string, unknown>]));
+    const linha = porNome.get("linha")?.["code"] as string;
+    const barras = porNome.get("barras")?.["code"] as string;
+    assert.ok(linha && barras);
+    assert.equal(decodeBoleto(linha)?.barcode, barras, "os dois exemplos precisam descrever o mesmo boleto");
+  });
+
+  test("o exemplo de feriados confere com o que a API devolve", () => {
+    const ano = allExamples().find((e) => e.onde.includes("/v1/holidays") && e.nome === "ano");
+    const valor = ano?.valor as { year: number; holidays: unknown[] };
+    assert.ok(valor, "o exemplo de feriados precisa existir");
+    assert.equal(valor.holidays.length, holidaysForYear(valor.year).length);
+    assert.deepEqual(valor.holidays, holidaysForYear(valor.year));
+  });
+
+  test("todo exemplo é serializável", () => {
+    for (const { onde, nome, valor } of allExamples()) {
+      assert.doesNotThrow(() => JSON.stringify(valor), `exemplo "${nome}" em ${onde}`);
+      assert.notEqual(valor, undefined, `exemplo "${nome}" em ${onde} está vazio`);
+    }
   });
 });
 
