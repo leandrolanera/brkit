@@ -15,6 +15,8 @@ Plataforma comum (chave de API, limite por minuto, cota mensal, medição e cobr
 | `POST /v1/pix/decode` `{ "br_code": "000201..." }` | Abre um BR Code: confere o CRC e devolve chave, beneficiário, valor e txid |
 | `POST /v1/boleto/decode` `{ "code": "00190.50095 ..." }` | Valida linha digitável (47/48) ou código de barras (44), converte entre as duas e extrai banco, valor e vencimento |
 | `POST /v1/payments/decode` `{ "code": "..." }` | Aceita Pix, linha digitável ou código de barras sem saber o formato antes; devolve envelope comum + decodificação nativa |
+| `POST /v1/nfe/decode` `{ "key": "3526..." }` | Lê a chave de acesso de NF-e, NFC-e, CT-e e MDF-e: confere o dígito e abre UF, emissão, CNPJ, modelo, série e número |
+| `POST /v1/nfe/key` `{ "uf", "issued", "cnpj", "model", "series", "number" }` | Monta a chave de acesso a partir dos campos e calcula o dígito verificador |
 | `GET` ou `POST /v1/validate/cnpj` | Valida CNPJ numérico e alfanumérico (módulo 11, ASCII − 48) |
 | `POST /v1/validate/cpf` `{ "value": "..." }` | Valida CPF (só por POST: é dado pessoal e query string vai para logs) |
 | `GET /v1/holidays?year=2026` | Feriados nacionais e pontos facultativos federais |
@@ -42,6 +44,8 @@ Cada endpoint resolve um problema concreto. A especificação em `/v1/openapi.js
 | Situação | Endpoint |
 |---|---|
 | Campo único de "código de pagamento" no app, ou leitor de câmera que tanto lê QR de Pix quanto código de barras — sem ramificar no cliente antes de saber o formato | `POST /v1/payments/decode` |
+| Conferir a chave que o fornecedor mandou antes de consultar a SEFAZ, ou descobrir de qual estado e mês é um documento sem abrir o XML | `POST /v1/nfe/decode` |
+| Montar a chave de acesso na hora de emitir, para o XML e o DANFE | `POST /v1/nfe/key` |
 | Cobrar no checkout, por WhatsApp ou numa fatura, com o número do pedido voltando no extrato do PSP | `POST /v1/pix/qr` |
 | Conferir o código que o cliente colou antes de dar baixa, ou casar um Pix recebido com o pedido pelo `txid` | `POST /v1/pix/decode` |
 | Dar baixa em boleto enviado por e-mail sem digitar valor e vencimento à mão | `POST /v1/boleto/decode` |
@@ -54,7 +58,7 @@ Cada endpoint resolve um problema concreto. A especificação em `/v1/openapi.js
 
 Dois argumentos que costumam decidir a compra, e que a documentação explica em detalhe:
 
-- **O CNPJ alfanumérico** está em vigor desde julho de 2026. Expressões regulares antigas que só aceitam dígitos passam a recusar empresa válida, e o cálculo do dígito mudou.
+- **O CNPJ alfanumérico** está em vigor desde julho de 2026. Expressões regulares antigas que só aceitam dígitos passam a recusar empresa válida, e o cálculo do dígito mudou. Pela NT 2026.004 isso alcança também a **chave de acesso da NF-e**: as 12 posições de raiz e ordem do CNPJ aceitam letras, e o dígito da chave passou a valer cada caractere pelo ASCII menos 48.
 - **O fator de vencimento do boleto** reiniciou em fevereiro de 2025, então todo fator mapeia duas datas possíveis. A resposta traz as duas leituras e sinaliza a ambiguidade, em vez de chutar.
 
 ### Regras da plataforma
@@ -228,6 +232,9 @@ Atenção: o Asaas pode pausar a fila do webhook depois de 15 falhas seguidas. O
 - Boleto: só **lê, valida e converte**. Não gera boleto: o campo livre (25 dígitos) segue regras próprias de cada banco, com nosso número, agência e conta — isso exige integração com o banco emissor.
 - Boleto: **o fator de vencimento é ambíguo.** Ele tem 4 dígitos, chegou a 9999 em 21/02/2025 e a FEBRABAN o reiniciou em 1000 em 22/02/2025, então todo fator mapeia duas datas possíveis a ~24,6 anos de distância, e nada no código de barras diferencia. A resposta traz `due_date_current_cycle` e `due_date_legacy_cycle`, e `due_date` elege a mais próxima de hoje. Se o seu caso envolve boletos antigos, use o campo explícito em vez do `due_date`.
 - Boleto: não consulta banco nenhum. Valida a estrutura e os dígitos verificadores, **não** diz se o boleto existe, está registrado, pago ou vencido.
+- NF-e: as tabelas de modelo e de forma de emissão são parciais — só o que está na especificação confirmada. Fora delas, `model_name` e `emission_type_name` voltam `null` em vez de um nome inventado, como já é feito com o nome do banco no boleto.
+- NF-e: o dígito da chave e os dígitos do CNPJ embutido são conferidos em separado (`check_digit_valid` e `cnpj_valid`), porque uma chave pode ter o próprio dígito certo e trazer um CNPJ malformado dentro.
+- NF-e: a validação é estrutural. **Não** diz se o documento existe, foi autorizado ou está cancelado — isso exige consultar a SEFAZ.
 - Boleto: a tabela de nomes de banco é parcial e cobre os emissores mais comuns; código fora dela devolve `bank_name: null` em vez de um nome errado. O `bank_code` vem sempre.
 - Boleto: na arrecadação, o vencimento só aparece quando a empresa usa as 8 primeiras posições do campo livre como AAAAMMDD, o que a FEBRABAN prevê mas não obriga. Fora disso vem `null`.
 - Feriados: só federais. Estaduais e municipais ficam para uma próxima versão.
@@ -288,6 +295,7 @@ lib/
   pix.ts        BR Code do Pix (EMV/BACEN): monta, decodifica e CRC-16
   boleto.ts     linha digitável e código de barras (cobrança e arrecadação)
   payments.ts   identifica o formato e decodifica (compõe pix.ts e boleto.ts)
+  nfe.ts        chave de acesso de NF-e, NFC-e, CT-e e MDF-e: lê e monta
   signup.ts     cadastro público: código de verificação e emissão da chave
   email.ts      envio transacional pelo Resend (sem dependências)
   holidays.ts   feriados nacionais e dias úteis

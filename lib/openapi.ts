@@ -1,4 +1,5 @@
 import { cobrancaBarcodeToLine, decodeBoleto, mod11Cobranca } from "./boleto.js";
+import { buildAccessKey, parseAccessKey } from "./nfe.js";
 import { decodePayment } from "./payments.js";
 import { holidaysForYear } from "./holidays.js";
 import { buildBrCode, LIMITS as PIX_LIMITS, parseBrCode } from "./pix.js";
@@ -45,6 +46,19 @@ const BOLETO_EXAMPLE = (() => {
   const line = cobrancaBarcodeToLine(barcode);
   return { barcode, line, decoded: decodeBoleto(line) };
 })();
+
+const NFE_EXAMPLE = {
+  numerica: "35260611222333000181550010000000011000000010",
+  alfanumerica: buildAccessKey({
+    uf: "SP",
+    issued: "2026-07",
+    cnpj: "12.ABC.345/01DE-35",
+    model: "55",
+    series: 1,
+    number: 1,
+    randomCode: "00000001",
+  }),
+};
 
 const CPF_EXAMPLE = "529.982.247-25";
 const CNPJ_EXAMPLE = "12.ABC.345/01DE-35";
@@ -131,6 +145,7 @@ export function buildOpenApiDocument(serverUrl?: string): Json {
       { name: "Pix", description: "BR Code do Pix (copia e cola)" },
       { name: "Boleto", description: "Linha digitável e código de barras" },
       { name: "Pagamentos", description: "Qualquer código de pagamento, sem saber o formato antes" },
+      { name: "Documento fiscal", description: "Chave de acesso de NF-e, NFC-e, CT-e e MDF-e" },
       { name: "Validação", description: "CPF e CNPJ" },
       { name: "Feriados", description: "Feriados nacionais e dias úteis" },
       { name: "Chaves", description: "Cadastro, rotação e recuperação" },
@@ -407,6 +422,86 @@ export function buildOpenApiDocument(serverUrl?: string): Json {
               boleto: ex("Reconhecido como boleto de cobrança", decodePayment(BOLETO_EXAMPLE.line)),
             }),
             "400": errorResponse("Conteúdo irreconhecível", "invalid_body", "unrecognized_code"),
+            ...meteredErrors(),
+          },
+        },
+      },
+
+      // --- Documento fiscal ----------------------------------------------
+      "/v1/nfe/decode": {
+        post: {
+          tags: ["Documento fiscal"],
+          operationId: "decodeAccessKey",
+          summary: "Lê a chave de acesso",
+          description:
+            "Confere o dígito verificador da chave de 44 caracteres e abre os campos: UF, mês de " +
+            "emissão, CNPJ do emitente, modelo, série, número e forma de emissão. Vale para NF-e, " +
+            "NFC-e, CT-e e MDF-e — é a mesma chave, o modelo é que muda.\n\n" +
+            "**Quando usar:** conferir a chave que o fornecedor mandou antes de consultar a SEFAZ, " +
+            "descobrir de qual estado e mês é um documento sem abrir o XML, ou validar o que o " +
+            "leitor de código de barras do DANFE capturou. Erro de digitação aqui vira consulta " +
+            "rejeitada e retrabalho.\n\n" +
+            "**CNPJ alfanumérico:** desde a NT 2026.004 (produção em 01/07/2026) as 12 posições de " +
+            "raiz e ordem do CNPJ aceitam letras, e o cálculo do dígito passou a valer cada " +
+            "caractere pelo ASCII menos 48. Validadores antigos recusam chave legítima.\n\n" +
+            "O dígito da chave e os dígitos do CNPJ embutido são conferidos em separado: " +
+            "`check_digit_valid` e `cnpj_valid`.",
+          requestBody: jsonBody(
+            {
+              type: "object",
+              required: ["key"],
+              properties: { key: { type: "string", maxLength: 64, description: "Os 44 caracteres, com ou sem pontuação." } },
+            },
+            {
+              numerica: ex("Chave com CNPJ numérico", { key: NFE_EXAMPLE.numerica }),
+              alfanumerica: ex("Chave com CNPJ alfanumérico", { key: NFE_EXAMPLE.alfanumerica }),
+            },
+          ),
+          responses: {
+            "200": jsonResponse("Campos da chave.", { $ref: "#/components/schemas/AccessKeyDecoded" }, {
+              numerica: ex("NF-e de São Paulo", parseAccessKey(NFE_EXAMPLE.numerica)),
+            }),
+            "400": errorResponse("Não tem a forma de uma chave", "invalid_body", "invalid_key_format"),
+            ...meteredErrors(),
+          },
+        },
+      },
+
+      "/v1/nfe/key": {
+        post: {
+          tags: ["Documento fiscal"],
+          operationId: "buildAccessKey",
+          summary: "Monta a chave a partir dos campos",
+          description:
+            "Calcula o dígito verificador e devolve a chave pronta, já decodificada para " +
+            "conferência.\n\n" +
+            "**Quando usar:** no momento de emitir. O ERP tem UF, data, CNPJ, modelo, série e " +
+            "número, e precisa da chave para montar o XML e imprimir o DANFE.\n\n" +
+            "`randomCode` (o cNF) é sorteado quando não vem, que é o que a especificação espera " +
+            "dele. Informe só para reproduzir uma chave existente.",
+          requestBody: jsonBody({ $ref: "#/components/schemas/AccessKeyRequest" }, {
+            nfe: ex("NF-e de São Paulo", {
+              uf: "SP",
+              issued: "2026-06",
+              cnpj: "11.222.333/0001-81",
+              model: "55",
+              series: 1,
+              number: 1,
+            }),
+          }),
+          responses: {
+            "201": jsonResponse("Chave montada.", {
+              type: "object",
+              properties: {
+                key: { type: "string" },
+                details: { $ref: "#/components/schemas/AccessKeyDecoded" },
+              },
+            }),
+            "400": errorResponse(
+              "Campo fora da especificação",
+              "invalid_body", "missing_fields", "invalid_uf", "invalid_issued", "invalid_cnpj",
+              "invalid_model", "invalid_emission_type", "invalid_random_code", "invalid_fields",
+            ),
             ...meteredErrors(),
           },
         },
@@ -924,6 +1019,45 @@ export function buildOpenApiDocument(serverUrl?: string): Json {
             company_id: { type: "string" },
             free_field: { type: "string" },
             due_date: { type: ["string", "null"], format: "date", description: "Só quando a empresa usa as 8 primeiras posições do campo livre como AAAAMMDD." },
+          },
+        },
+
+        AccessKeyRequest: {
+          type: "object",
+          required: ["uf", "issued", "cnpj", "model", "series", "number"],
+          properties: {
+            uf: { type: "string", description: "Sigla do estado (`SP`) ou código do IBGE (`35`)." },
+            issued: { type: "string", description: "Ano e mês da emissão: `AAAA-MM` ou `AAMM`." },
+            cnpj: { type: "string", description: "CNPJ do emitente, com ou sem pontuação. Aceita alfanumérico." },
+            model: { type: "string", enum: ["55", "57", "58", "65"], description: "55 NF-e, 57 CT-e, 58 MDF-e, 65 NFC-e." },
+            series: { type: ["string", "integer"], description: "Completado com zeros à esquerda." },
+            number: { type: ["string", "integer"], description: "Completado com zeros à esquerda." },
+            emissionType: { type: ["string", "integer"], default: 1, description: "Forma de emissão. 1 é normal." },
+            randomCode: { type: "string", description: "cNF, 8 dígitos. Ausente, é sorteado." },
+          },
+        },
+
+        AccessKeyDecoded: {
+          type: "object",
+          properties: {
+            valid: { type: "boolean", description: "Estrutura, dígito da chave e dígitos do CNPJ, todos conferindo." },
+            check_digit_valid: { type: "boolean", description: "Só o dígito verificador da chave." },
+            key: { type: "string", description: "Normalizada: sem pontuação, em maiúsculas." },
+            uf_code: { type: "string" },
+            uf: { type: ["string", "null"], description: "Sigla, ou null se o código não for de nenhum estado." },
+            issued: { type: "string", description: "AAAA-MM." },
+            cnpj: { type: "string" },
+            cnpj_kind: { type: "string", enum: ["numeric", "alphanumeric"] },
+            cnpj_valid: { type: "boolean", description: "Dígitos verificadores do CNPJ embutido." },
+            model: { type: "string" },
+            model_name: { type: ["string", "null"], description: "Tabela com os quatro modelos da especificação; fora dela, null." },
+            series: { type: "string" },
+            number: { type: "string" },
+            emission_type: { type: "string" },
+            emission_type_name: { type: ["string", "null"] },
+            random_code: { type: "string", description: "cNF: código aleatório que o emitente sorteia." },
+            check_digit: { type: "string" },
+            errors: { type: "array", items: { type: "string" } },
           },
         },
 
