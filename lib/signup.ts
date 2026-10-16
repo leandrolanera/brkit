@@ -235,6 +235,12 @@ export async function verifySignup(deps: VerifyDeps, rawEmail: string, code: str
   const email = requireEmail(rawEmail);
   const hash = hashEmail(email);
 
+  // O código vem PRIMEIRO, de propósito. Checar a existência da chave antes daria um oráculo
+  // de enumeração: com um código qualquer dava para separar "este e-mail tem chave" (409) de
+  // "não tem" (400), anulando a razão de `POST /v1/signup` responder 202 nos dois casos.
+  // Exigindo o código antes, só descobre quem já controla a caixa de entrada.
+  await consumeCode(store, "signup", hash, code);
+
   if (await store.get<string>(ownerKey(hash))) {
     throw new SignupError(
       409,
@@ -242,8 +248,6 @@ export async function verifySignup(deps: VerifyDeps, rawEmail: string, code: str
       "Já existe uma chave emitida para este e-mail. Para substituí-la, use POST /v1/keys/recover.",
     );
   }
-
-  await consumeCode(store, "signup", hash, code);
 
   const { key, record } = await createApiKey(store, email, "free");
   // Índice de dono: é o que garante uma chave por e-mail. Gravado depois da chave, para não

@@ -61,6 +61,7 @@ Decisões que valem saber:
 
 - **Código por e-mail, confirmado via POST** — e não link clicável. Um token em query string iria para log de acesso, o que contraria a mesma regra que faz o CPF só ser aceito por POST neste projeto. Também dispensa qualquer página HTML.
 - **A resposta de `/v1/signup` é 202 em todo e-mail válido**, exista chave para ele ou não. Dizer a diferença daria um jeito de descobrir quem está cadastrado; quem já tem chave recebe um e-mail explicando, em vez de um código.
+- Na verificação, **o código é conferido antes da existência da chave**. Na ordem inversa, um código qualquer separaria "este e-mail tem chave" (409) de "não tem" (400), anulando o 202 acima. Exigindo o código primeiro, só descobre quem já controla a caixa de entrada.
 - **O e-mail não é gravado em claro.** As chaves do Redis usam o hash dele, e do código guardamos só o hash — como já era feito com as chaves de API.
 - **Uma chave por e-mail.** O código vale 30 minutos e aceita 5 tentativas; esgotadas, ele é invalidado e é preciso pedir outro. O contador usa `incr`, atômico, então chamadas simultâneas não furam o limite.
 - **Limites da rota pública:** 5 pedidos por minuto por IP e 2 por minuto por e-mail (para o cadastro não servir de ferramenta para inundar a caixa de alguém); 10 verificações por minuto por IP.
@@ -75,7 +76,9 @@ Duas decisões que vale conhecer antes de mexer:
 - **Os dados da página foram gerados pelo código do projeto.** A linha digitável do exemplo é um boleto válido de verdade (DV geral por módulo 11, DVs de campo por módulo 10), o BR Code tem CRC conferido, o CNPJ alfanumérico é o exemplo oficial da Receita. Se for trocar algum, gere com `lib/boleto.ts` / `lib/pix.ts` em vez de inventar — a página não deve conseguir mentir.
 - **As fontes vêm do Google Fonts** (Chivo e Azeret Mono), que é a única dependência externa da página. Se isso incomodar, dá para hospedar os `woff2` no próprio domínio; o desenho degrada para as fontes do sistema sem quebrar.
 
-O comando `curl` mostrado troca o placeholder pelo domínio de onde a página foi servida, para funcionar colado. Em `localhost` o placeholder é mantido.
+A página faz o cadastro em duas etapas, chamando `/v1/signup` e `/v1/signup/verify` do mesmo domínio. O `curl` continua ali, embaixo: é o caminho de quem prefere a linha de comando **e** o que funciona se o JavaScript falhar. Ele troca o placeholder pelo domínio de onde a página foi servida, para funcionar colado; em `localhost` o placeholder é mantido.
+
+O JavaScript da página **não está na suíte automatizada** — testá-lo exigiria um navegador headless, dependência que o projeto não tem. Os doze estados de erro, o reenvio, a correção de endereço, a tecla Enter e a exibição da chave foram exercitados no navegador, com as respostas da API simuladas. Mexendo ali, refaça essa conferência.
 
 ## Documentação OpenAPI
 
@@ -287,13 +290,13 @@ Lista mantida em ordem de prioridade. O que está em "verificação externa" nã
 ### Produto
 
 4. **Renderizador do OpenAPI na própria página**, se valer trazer um script de CDN (Scalar, Redoc) para o projeto. Hoje a landing só aponta para o `/v1/openapi.json` cru.
-5. **Cadastro pela página**, com campo de e-mail e de código chamando `/v1/signup`. Hoje a conversão é copiar um `curl`, o que serve ao público de desenvolvedor mas exclui quem só quer testar.
-6. **Revisar planos e preços** em `lib/plans.ts`, hoje provisórios, depois de medir custo real.
+5. **Revisar planos e preços** em `lib/plans.ts`, hoje provisórios, depois de medir custo real.
 
 ### Técnico
 
-7. **Carência na rotação**, se a troca sem janela se mostrar incômoda na prática: aceitar o segredo anterior por alguns minutos.
-8. **Reconciliação ativa**, por rotina agendada, em vez de só no `GET /v1/billing`. Hoje a autocura depende de o cliente consultar o status.
+6. **Carência na rotação**, se a troca sem janela se mostrar incômoda na prática: aceitar o segredo anterior por alguns minutos.
+7. **Reconciliação ativa**, por rotina agendada, em vez de só no `GET /v1/billing`. Hoje a autocura depende de o cliente consultar o status.
+8. **Teste automatizado do JavaScript da landing**, se ela crescer. Hoje a conferência é manual no navegador; um runner headless é dependência nova e só se paga com mais interface.
 9. **Paginação nas consultas ao Asaas.** O limite de 100 por página cobre mais de 8 anos de assinatura mensal, mas não é infinito.
 10. **HTML → PDF e screenshot.** Precisa de Chromium headless: avaliar a Vercel com build compacto ou uma VPS pequena. É projeto, não tarefa.
 11. **Créditos pré-pagos**, necessários antes de qualquer endpoint com IA. O gancho já existe em `withApi(handler, { cost: N })`.

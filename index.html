@@ -299,6 +299,93 @@
   }
   .cmd button:hover { background: #26403d; color: #fff; }
 
+  /* --- cadastro pela página -------------------------------------------
+     Reusa .sheet/.field/.grid: o formulário é só mais uma ficha de campo.
+     Disciplina da tipografia mantida — o código é dado de máquina e vai em
+     mono; o e-mail é dado da pessoa e vai em Chivo.                        */
+  .signup { margin-bottom: 1.25rem; }
+  .entry { display: flex; align-items: stretch; gap: 0.5rem; flex-wrap: wrap; }
+  .entry input {
+    flex: 1 1 16rem;
+    min-width: 0;
+    appearance: none;
+    background: var(--paper);
+    border: 1px solid var(--rule-firm);
+    padding: 0.625rem 0.75rem;
+    font: 400 1.0625rem/1.3 var(--human);
+    color: var(--ink);
+  }
+  .entry input::placeholder { color: #93a09c; }
+  .entry input:focus-visible { outline: 2px solid var(--ink); outline-offset: 1px; }
+  #code {
+    font-family: var(--machine);
+    font-weight: 500;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    flex-basis: 11rem;
+    flex-grow: 0;
+  }
+  .entry button {
+    appearance: none;
+    background: var(--ink);
+    color: var(--paper);
+    border: 1px solid var(--ink);
+    padding: 0.625rem 1.125rem;
+    font: 700 0.9375rem/1.3 var(--human);
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .entry button:hover:not(:disabled) { background: #1d3331; }
+  .entry button:disabled { opacity: 0.55; cursor: progress; }
+
+  .aside { margin: 0.75rem 0 0; font-size: 0.875rem; color: var(--ink-soft); }
+  .linkish {
+    appearance: none;
+    background: none;
+    border: 0;
+    padding: 0;
+    font: inherit;
+    color: var(--ink);
+    text-decoration: underline;
+    text-decoration-color: var(--rule-firm);
+    text-underline-offset: 3px;
+    cursor: pointer;
+  }
+  .linkish:hover { text-decoration-color: currentColor; }
+
+  /* Falha é direção, não lamento: diz o que houve e o que fazer. */
+  .formnote {
+    margin: 0;
+    padding: 0.75rem 1rem;
+    border-top: 1px solid var(--rule-firm);
+    background: var(--paper-dim);
+    font-size: 0.9375rem;
+  }
+  .formnote[data-tone="bad"] { color: var(--boleto); }
+  .formnote[data-tone="good"] { color: var(--pix); }
+
+  .issued { margin-bottom: 1.25rem; border-width: 2px; }
+  .issued .key {
+    flex: 1 1 20rem;
+    min-width: 0;
+    font-size: clamp(0.875rem, 2.4vw, 1.25rem);
+    font-weight: 700;
+    align-self: center;
+  }
+  .verdict.warn { background: #f0e6d2; border-top-color: var(--dates); }
+  .verdict.warn b { color: #7a5612; }
+
+  .cli { margin-top: 2rem; }
+  .cli summary {
+    cursor: pointer;
+    font-size: 0.9375rem;
+    color: var(--ink-soft);
+    padding-block: 0.375rem;
+  }
+  .cli summary:hover { color: var(--ink); }
+  .cli > .steps { margin-top: 1.5rem; }
+  .mono { font-family: var(--machine); font-size: 0.9375em; }
+
   /* --- limites: a seção honesta -------------------------------------- */
   .limits { margin: 0; max-width: 46rem; }
   .limits div { display: grid; grid-template-columns: minmax(8rem, 11.5rem) 1fr; gap: 0 1.5rem; padding-block: 0.875rem; border-top: 1px solid var(--rule); }
@@ -484,34 +571,83 @@
       <p class="note">Gratuito, sem cartão: 1.000 chamadas por mês e 10 por minuto. Precisa de um
         e-mail que você consiga abrir.</p>
 
-      <ol class="steps">
-        <li>
-          <div>
-            <h3>Peça o código</h3>
-            <div class="cmd">
-              <button type="button" data-copy="curl -X POST https://SEU-DOMINIO/v1/signup -H 'content-type: application/json' -d '{&quot;email&quot;:&quot;voce@exemplo.com.br&quot;}'">Copiar</button>
+      <!-- Formulário no mesmo vernáculo de caixa de campo do resto da página.
+           O curl segue abaixo: é o caminho de quem prefere a linha de comando e
+           também o que funciona se o JavaScript falhar. -->
+      <form class="sheet signup" id="signup" novalidate>
+        <div class="field" data-step="email">
+          <label class="label" for="email">Seu e-mail</label>
+          <div class="entry">
+            <input id="email" name="email" type="email" inputmode="email" autocomplete="email"
+                   placeholder="voce@exemplo.com.br" required>
+            <button type="submit" data-action="send">Enviar código</button>
+          </div>
+        </div>
+
+        <div class="field" data-step="code" hidden>
+          <label class="label" for="code">Código recebido em <b id="sent-to"></b></label>
+          <div class="entry">
+            <input id="code" name="code" type="text" inputmode="latin" autocomplete="one-time-code"
+                   maxlength="8" spellcheck="false" placeholder="ABCD2345">
+            <button type="submit" data-action="verify">Confirmar</button>
+          </div>
+          <p class="aside">Oito caracteres, válidos por 30 minutos. Errou o endereço ou o código não
+            chegou? Confira o campo acima e
+            <button type="button" class="linkish" data-action="resend">envie outro código</button>.
+          </p>
+        </div>
+
+        <p class="formnote" id="formnote" role="status" aria-live="polite" hidden></p>
+      </form>
+
+      <!-- A chave aparece uma única vez: este é o momento que a página existe para entregar. -->
+      <div class="sheet issued" id="issued" hidden>
+        <div class="field">
+          <span class="label">Sua chave de API</span>
+          <div class="entry">
+            <p class="string key" id="issued-key"></p>
+            <button type="button" data-action="copy-key">Copiar</button>
+          </div>
+        </div>
+        <div class="grid">
+          <div class="field"><span class="label">Plano</span><span class="value text" id="issued-plan"></span></div>
+          <div class="field"><span class="label">Chamadas por mês</span><span class="value" id="issued-quota"></span></div>
+          <div class="field"><span class="label">Por minuto</span><span class="value" id="issued-rate"></span></div>
+        </div>
+        <p class="verdict warn">
+          <b>Guarde agora.</b> A chave não será exibida de novo: o que fica guardado aqui é o hash dela.
+        </p>
+      </div>
+
+      <details class="cli">
+        <summary>Prefere a linha de comando?</summary>
+        <ol class="steps">
+          <li>
+            <div>
+              <h3>Peça o código</h3>
+              <div class="cmd">
+                <button type="button" data-copy="curl -X POST https://SEU-DOMINIO/v1/signup -H 'content-type: application/json' -d '{&quot;email&quot;:&quot;voce@exemplo.com.br&quot;}'">Copiar</button>
 <pre>curl -X POST https://SEU-DOMINIO/v1/signup <span class="flag">\
   -H</span> <span class="str">'content-type: application/json'</span> <span class="flag">\
   -d</span> <span class="str">'{"email":"voce@exemplo.com.br"}'</span></pre>
+              </div>
             </div>
-            <p>Chega um código de oito caracteres por e-mail. Vale 30 minutos.</p>
-          </div>
-        </li>
-        <li>
-          <div>
-            <h3>Confirme e receba a chave</h3>
-            <div class="cmd">
-              <button type="button" data-copy="curl -X POST https://SEU-DOMINIO/v1/signup/verify -H 'content-type: application/json' -d '{&quot;email&quot;:&quot;voce@exemplo.com.br&quot;,&quot;code&quot;:&quot;ABCD2345&quot;}'">Copiar</button>
+          </li>
+          <li>
+            <div>
+              <h3>Confirme e receba a chave</h3>
+              <div class="cmd">
+                <button type="button" data-copy="curl -X POST https://SEU-DOMINIO/v1/signup/verify -H 'content-type: application/json' -d '{&quot;email&quot;:&quot;voce@exemplo.com.br&quot;,&quot;code&quot;:&quot;ABCD2345&quot;}'">Copiar</button>
 <pre>curl -X POST https://SEU-DOMINIO/v1/signup/verify <span class="flag">\
   -H</span> <span class="str">'content-type: application/json'</span> <span class="flag">\
   -d</span> <span class="str">'{"email":"voce@exemplo.com.br","code":"ABCD2345"}'</span></pre>
+              </div>
+              <p>Se perder a chave, <span class="mono">POST /v1/keys/recover</span> emite outra pelo
+                mesmo e-mail, preservando plano e cota.</p>
             </div>
-            <p>A chave vem nessa resposta e <strong>só nessa</strong> — o que fica guardado aqui é
-              o hash dela. Se perder, <span style="font-family:var(--machine);font-size:0.9375em">POST /v1/keys/recover</span>
-              emite outra pelo mesmo e-mail, preservando plano e cota.</p>
-          </div>
-        </li>
-      </ol>
+          </li>
+        </ol>
+      </details>
     </section>
 
     <section>
@@ -591,6 +727,143 @@
       } else {
         node.innerHTML = node.innerHTML.replace(/https:\/\/SEU-DOMINIO/g, host);
       }
+    });
+  })();
+
+  // --- cadastro pela página -------------------------------------------
+  // Chama as mesmas rotas do curl logo abaixo. Se o JavaScript falhar, o
+  // caminho de linha de comando continua ali, inteiro.
+  (function () {
+    var form = document.getElementById('signup');
+    if (!form) return;
+
+    var stepEmail = form.querySelector('[data-step="email"]');
+    var stepCode  = form.querySelector('[data-step="code"]');
+    var emailIn   = document.getElementById('email');
+    var codeIn    = document.getElementById('code');
+    var sentTo    = document.getElementById('sent-to');
+    var note      = document.getElementById('formnote');
+    var issued    = document.getElementById('issued');
+    var busy      = false;
+
+    // Falha é direção: cada caso diz o que houve e o que fazer em seguida.
+    var MESSAGES = {
+      invalid_email:      'Esse endereço não parece válido. Confira e tente de novo.',
+      rate_limited:       'Já enviamos um código para esse endereço há pouco. Procure na caixa de entrada, inclusive no spam.',
+      email_send_failed:  'O e-mail não saiu. Tente de novo em instantes.',
+      signup_unavailable: 'O cadastro está fora do ar agora. Tente de novo mais tarde.',
+      invalid_code:       'O código não confere. Confira os oito caracteres e tente de novo.',
+      too_many_attempts:  'Tentativas esgotadas para este código. Peça um novo.',
+      no_pending_code:    'Não há código pendente para este endereço. Peça outro — e se você já tinha uma chave, a mensagem que chegou explica como substituí-la.',
+      key_already_issued: 'Este e-mail já tem uma chave. Para trocá-la, use a recuperação descrita na especificação.',
+      invalid_body:       'Faltou preencher algum campo. Confira e tente de novo.'
+    };
+
+    function say(text, tone) {
+      note.textContent = text;
+      note.hidden = !text;
+      if (tone) note.setAttribute('data-tone', tone); else note.removeAttribute('data-tone');
+    }
+
+    function working(button, on, label) {
+      busy = on;
+      form.querySelectorAll('button').forEach(function (b) { b.disabled = on; });
+      if (button) button.textContent = on ? label : button.getAttribute('data-idle');
+    }
+
+    function remember(button) {
+      if (!button.getAttribute('data-idle')) button.setAttribute('data-idle', button.textContent);
+    }
+
+    async function send(url, body) {
+      var res = await fetch(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+      var data = null;
+      try { data = await res.json(); } catch (e) { /* resposta sem JSON */ }
+      return { ok: res.ok, status: res.status, data: data };
+    }
+
+    function explain(result) {
+      var code = result.data && result.data.error && result.data.error.code;
+      return MESSAGES[code] || 'Não foi possível concluir agora. Tente de novo.';
+    }
+
+    async function requestCode(button, resending) {
+      var email = emailIn.value.trim();
+      if (!email) { say(MESSAGES.invalid_email, 'bad'); emailIn.focus(); return; }
+
+      remember(button);
+      working(button, true, 'Enviando…');
+      try {
+        var result = await send('/v1/signup', { email: email });
+        if (!result.ok) { say(explain(result), 'bad'); return; }
+
+        sentTo.textContent = email;
+        stepCode.hidden = false;
+        say(resending ? 'Enviamos outro código.' : 'Código enviado. Procure na caixa de entrada, inclusive no spam.', 'good');
+        codeIn.focus();
+      } catch (e) {
+        say('Não foi possível falar com o servidor. Verifique a conexão e tente de novo.', 'bad');
+      } finally {
+        working(button, false);
+      }
+    }
+
+    async function confirmCode(button) {
+      var code = codeIn.value.trim();
+      if (!code) { say('Digite o código que chegou por e-mail.', 'bad'); codeIn.focus(); return; }
+
+      remember(button);
+      working(button, true, 'Confirmando…');
+      try {
+        var result = await send('/v1/signup/verify', { email: emailIn.value.trim(), code: code });
+        if (!result.ok) { say(explain(result), 'bad'); codeIn.select(); return; }
+
+        var limits = result.data.limits || {};
+        document.getElementById('issued-key').textContent = result.data.api_key;
+        document.getElementById('issued-plan').textContent = result.data.plan;
+        document.getElementById('issued-quota').textContent = (limits.monthly_quota || 0).toLocaleString('pt-BR');
+        document.getElementById('issued-rate').textContent = limits.per_minute || '';
+        form.hidden = true;
+        issued.hidden = false;
+        issued.querySelector('[data-action="copy-key"]').focus();
+      } catch (e) {
+        say('Não foi possível falar com o servidor. Verifique a conexão e tente de novo.', 'bad');
+      } finally {
+        working(button, false);
+      }
+    }
+
+    form.addEventListener('submit', function (e) {
+      e.preventDefault();
+      if (busy) return;
+      // event.submitter diz qual botão enviou. Não dá para usar activeElement:
+      // o Safari no macOS não foca o botão ao clicar.
+      var fallback = stepCode.hidden ? 'send' : 'verify';
+      var button = e.submitter && e.submitter.getAttribute('data-action')
+        ? e.submitter
+        : form.querySelector('[data-action="' + fallback + '"]');
+      if (button.getAttribute('data-action') === 'verify') confirmCode(button);
+      else requestCode(button, false);
+    });
+
+    form.querySelector('[data-action="resend"]').addEventListener('click', function () {
+      if (!busy) requestCode(form.querySelector('[data-action="send"]'), true);
+    });
+
+    issued.querySelector('[data-action="copy-key"]').addEventListener('click', function () {
+      var button = this;
+      var key = document.getElementById('issued-key').textContent;
+      navigator.clipboard.writeText(key).then(
+        function () {
+          button.textContent = 'Copiada';
+          setTimeout(function () { button.textContent = 'Copiar'; }, 2000);
+        },
+        function () { button.textContent = 'Selecione e copie'; }
+      );
     });
   })();
 

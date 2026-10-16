@@ -261,16 +261,45 @@ describe("verifySignup", () => {
     assert.ok(!results.includes("ok"));
   });
 
-  test("uma chave por e-mail: a segunda tentativa é recusada", async () => {
+  test("uma chave por e-mail: quem já tem não consegue outro código", async () => {
     const primeiro = await pedirCodigo();
     await verifySignup({ store }, EMAIL, primeiro.code);
 
-    // Mesmo com um código pendente forjado, o índice de dono barra.
+    // A regra é aplicada antes: startSignup não emite código para quem já tem chave.
     const fake = fakeSender();
     await startSignup({ store, email: fake.sender }, EMAIL);
+    assert.equal(fake.lastCode(), null);
     await assert.rejects(
       () => verifySignup({ store }, EMAIL, "ABCD2345"),
-      (err: unknown) => err instanceof SignupError && err.status === 409 && err.code === "key_already_issued",
+      (err: unknown) => err instanceof SignupError && err.code === "no_pending_code",
+    );
+  });
+
+  test("não dá para descobrir quem tem chave pela verificação", async () => {
+    // Oráculo de enumeração: se a existência da chave fosse checada ANTES do código, um
+    // código qualquer separaria "tem chave" (409) de "não tem" (400) — anulando a razão de
+    // POST /v1/signup responder 202 nos dois casos.
+    const { code } = await pedirCodigo();
+    await verifySignup({ store }, EMAIL, code); // este e-mail agora TEM chave
+
+    const comChave = await verifySignup({ store }, EMAIL, "ZZZZZZZZ").then(
+      () => "ok",
+      (err: unknown) => (err instanceof SignupError ? `${err.status}/${err.code}` : "outro"),
+    );
+    const semChave = await verifySignup({ store }, "ninguem@exemplo.com.br", "ZZZZZZZZ").then(
+      () => "ok",
+      (err: unknown) => (err instanceof SignupError ? `${err.status}/${err.code}` : "outro"),
+    );
+
+    assert.equal(comChave, semChave, "a resposta precisa ser indistinguível sem um código válido");
+  });
+
+  test("o código é de uso único", async () => {
+    const { code } = await pedirCodigo();
+    assert.ok((await verifySignup({ store }, EMAIL, code)).api_key);
+    await assert.rejects(
+      () => verifySignup({ store }, EMAIL, code),
+      (err: unknown) => err instanceof SignupError && err.code === "no_pending_code",
     );
   });
 
@@ -430,9 +459,10 @@ describe("POST /v1/signup/verify", () => {
     assert.equal(out.plan, "free");
     assert.equal(out.limits.monthly_quota, 1000);
 
-    // Repetir não emite outra chave.
+    // Repetir não emite outra chave: o código foi consumido.
     const repetido = await post({ email: EMAIL, code });
-    assert.equal(repetido.status, 409);
+    assert.equal(repetido.status, 400);
+    assert.equal(((await repetido.json()) as { error: { code: string } }).error.code, "no_pending_code");
   });
 
   test("entrada incompleta é 400", async () => {
