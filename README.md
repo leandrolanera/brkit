@@ -304,6 +304,29 @@ scripts/create-key.ts
 test/
 ```
 
+## Conferindo uma instalação de verdade
+
+Toda a suíte roda contra duplos escritos neste repositório — o que prova coerência interna, não conformidade. `npm run verify` é o contrário: fala com o serviço no ar e compara o que ele devolve com o que as mesmas funções da lib calculam aqui.
+
+```bash
+npm run verify -- --url https://SEU-DOMINIO                      # só rotas públicas
+npm run verify -- --url https://SEU-DOMINIO --key ak_live_...    # tudo que é leitura
+```
+
+Por padrão **só faz leitura**. O que tem efeito colateral é explícito:
+
+| Opção | O que faz |
+|---|---|
+| `--signup voce@exemplo.com.br` | **Envia e-mail de verdade.** Depois rode de novo com `--code OCODIGO` |
+| `--checkout --document SEU-CPF` | **Cria assinatura no Asaas.** Use só no sandbox |
+| `--boleto 'LINHA DIGITÁVEL'` | Decodifica um boleto seu e mostra os campos para conferir contra o papel |
+| `--nfe 'OS 44 DÍGITOS'` | Idem para uma chave de acesso real |
+| `--pix SUA-CHAVE-PIX` | Gera um QR de R$ 0,01 para escanear no app do banco |
+
+Sai com código 1 se alguma conferência falhar e 2 se a instalação estiver inacessível, então serve em CI. Segredos saem de `.env.local` (já ignorado pelo git) ou do ambiente, e nunca são impressos.
+
+Falha vem com o que fazer em seguida — 503 no cadastro aponta a variável que falta, `/` em 404 aponta onde o `index.html` deveria estar.
+
 ## Pendências
 
 Lista mantida em ordem de prioridade. O que está em "verificação externa" não é resolvível escrevendo código: depende de credencial, deploy ou de um aparelho real.
