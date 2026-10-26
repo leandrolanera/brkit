@@ -343,6 +343,7 @@ Lista mantida em ordem de prioridade. O que está em "verificação externa" nã
 3. **Confirmar que o `index.html` da raiz é servido em `/` no deploy.** A documentação da Vercel não é explícita para projetos sem framework que também têm `api/`; se não for, basta um `outputDirectory` ou mover o arquivo.
 4. **Enviar um e-mail de verdade pelo Resend.** O cliente está conferido na documentação, mas nenhum e-mail saiu. Exige domínio verificado na conta.
 5. **Conferir um boleto real.** Os algoritmos batem com os exemplos resolvidos da FEBRABAN e com um par código de barras/linha digitável de terceiro; falta passar uma linha digitável de boleto recebido de verdade.
+6. **Conferir uma chave de NF-e real.** O cálculo bate com o exemplo numérico publicado e com um alfanumérico remontado a partir dos campos declarados (a string publicada original tinha 45 caracteres, estava malformada). Falta decodificar a chave de uma nota fiscal de verdade — de preferência uma com CNPJ alfanumérico, formato ainda raro em notas emitidas.
 
 ### Produto
 
