@@ -1,4 +1,4 @@
-# apis-portfolio
+# brkit.dev
 
 Plataforma comum (chave de API, limite por minuto, cota mensal, medição e cobrança pelo Asaas) com as primeiras APIs do portfólio, pronta para a Vercel.
 
@@ -75,11 +75,11 @@ Dois argumentos que costumam decidir a compra, e que a documentação explica em
 Qualquer pessoa obtém uma chave free verificando um e-mail. A verificação existe para dar algum custo à obtenção da chave: sem ela, criar chaves em massa seria trivial.
 
 ```bash
-curl -X POST https://SEU-DOMINIO/v1/signup \
+curl -X POST https://brkit.dev/v1/signup \
   -H "content-type: application/json" -d '{ "email": "voce@exemplo.com.br" }'
 # chega um código de 8 caracteres por e-mail
 
-curl -X POST https://SEU-DOMINIO/v1/signup/verify \
+curl -X POST https://brkit.dev/v1/signup/verify \
   -H "content-type: application/json" -d '{ "email": "voce@exemplo.com.br", "code": "ABCD2345" }'
 # { "api_key": "ak_live_...", ... }  <- aparece só aqui
 ```
@@ -128,12 +128,12 @@ Dois caminhos, para situações diferentes:
 
 ```bash
 # Ainda tenho a chave e quero trocá-la (suspeita de vazamento, higiene periódica)
-curl -X POST https://SEU-DOMINIO/v1/keys/rotate -H "x-api-key: ak_live_..."
+curl -X POST https://brkit.dev/v1/keys/rotate -H "x-api-key: ak_live_..."
 
 # Perdi a chave: o e-mail é a identidade
-curl -X POST https://SEU-DOMINIO/v1/keys/recover \
+curl -X POST https://brkit.dev/v1/keys/recover \
   -H "content-type: application/json" -d '{ "email": "voce@exemplo.com.br" }'
-curl -X POST https://SEU-DOMINIO/v1/keys/recover/verify \
+curl -X POST https://brkit.dev/v1/keys/recover/verify \
   -H "content-type: application/json" -d '{ "email": "voce@exemplo.com.br", "code": "ABCD2345" }'
 ```
 
@@ -153,7 +153,7 @@ O que mais vale saber:
 Fluxo: o cliente já tem uma chave free, chama `POST /v1/billing/checkout` com o plano e os dados de quem paga, recebe o link da fatura do Asaas (onde escolhe Pix, boleto ou cartão) e paga. O Asaas avisa pelo webhook e a chave sobe de plano.
 
 ```bash
-curl -X POST https://SEU-DOMINIO/v1/billing/checkout \
+curl -X POST https://brkit.dev/v1/billing/checkout \
   -H "x-api-key: ak_live_..." -H "content-type: application/json" \
   -d '{ "plan": "pro", "customer": { "name": "Maria Souza", "document": "529.982.247-25", "email": "maria@exemplo.com.br" } }'
 ```
@@ -205,7 +205,7 @@ O mesmo vale para o cliente, com consequência menor: cliente duplicado não cob
    - `ASAAS_ENV`: `sandbox` (padrão) ou `production`. Produção só é usada se você pedir explicitamente.
    - `ASAAS_WEBHOOK_TOKEN`: um token seu, de 32 a 255 caracteres, sem espaços, sem sequências simples e diferente da chave de API.
    - `BILLING_SUCCESS_URL` (opcional): para onde o cliente volta depois de pagar.
-3. No Asaas, cadastre um webhook apontando para `https://SEU-DOMINIO/api/webhooks/asaas`, com o mesmo token em `ASAAS_WEBHOOK_TOKEN` (o Asaas o envia no header `asaas-access-token`), e marque os eventos da tabela acima.
+3. No Asaas, cadastre um webhook apontando para `https://brkit.dev/api/webhooks/asaas`, com o mesmo token em `ASAAS_WEBHOOK_TOKEN` (o Asaas o envia no header `asaas-access-token`), e marque os eventos da tabela acima.
 4. Teste tudo no sandbox antes de trocar para produção.
 
 Atenção: o Asaas pode pausar a fila do webhook depois de 15 falhas seguidas. O endpoint responde 200 para eventos ignorados e repetidos justamente para isso; se o seu deploy cair, confira o webhook no painel.
@@ -269,10 +269,10 @@ A chave aparece uma única vez; só o hash fica guardado. Chaves criadas com `--
 5. Teste:
 
 ```bash
-curl -H "x-api-key: ak_live_..." "https://SEU-DOMINIO/v1/holidays?year=2026"
-curl -H "x-api-key: ak_live_..." "https://SEU-DOMINIO/v1/validate/cnpj?value=12.ABC.345/01DE-35"
-curl -H "x-api-key: ak_live_..." "https://SEU-DOMINIO/v1/qr?data=https://exemplo.com.br" -o qr.png
-curl -H "x-api-key: ak_live_..." "https://SEU-DOMINIO/v1/billing"
+curl -H "x-api-key: ak_live_..." "https://brkit.dev/v1/holidays?year=2026"
+curl -H "x-api-key: ak_live_..." "https://brkit.dev/v1/validate/cnpj?value=12.ABC.345/01DE-35"
+curl -H "x-api-key: ak_live_..." "https://brkit.dev/v1/qr?data=https://exemplo.com.br" -o qr.png
+curl -H "x-api-key: ak_live_..." "https://brkit.dev/v1/billing"
 ```
 
 ## Estrutura
@@ -309,8 +309,8 @@ test/
 Toda a suíte roda contra duplos escritos neste repositório — o que prova coerência interna, não conformidade. `npm run verify` é o contrário: fala com o serviço no ar e compara o que ele devolve com o que as mesmas funções da lib calculam aqui.
 
 ```bash
-npm run verify -- --url https://SEU-DOMINIO                      # só rotas públicas
-npm run verify -- --url https://SEU-DOMINIO --key ak_live_...    # tudo que é leitura
+npm run verify -- --url https://brkit.dev                      # só rotas públicas
+npm run verify -- --url https://brkit.dev --key ak_live_...    # tudo que é leitura
 ```
 
 Por padrão **só faz leitura**. O que tem efeito colateral é explícito:

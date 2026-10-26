@@ -206,7 +206,7 @@ export function buildOpenApiDocument(serverUrl?: string): Json {
             "201": jsonResponse("QR Code criado.", { $ref: "#/components/schemas/DynamicQrCreated" }, {
               cardapio: ex("Resposta da criação acima", {
                 id: "k3Dm9Qz",
-                short_url: "https://SEU-DOMINIO/r/k3Dm9Qz",
+                short_url: "https://brkit.dev/r/k3Dm9Qz",
                 target_url: "https://livrariasaojorge.com.br/cardapio",
                 image_data_url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg… (PNG completo, encurtado aqui)",
               }),
