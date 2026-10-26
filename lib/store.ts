@@ -11,6 +11,7 @@ export interface Store {
   incr(key: string): Promise<number>;
   incrBy(key: string, amount: number): Promise<number>;
   expire(key: string, seconds: number): Promise<void>;
+  del(key: string): Promise<void>;
 }
 
 class MemoryStore implements Store {
@@ -54,9 +55,20 @@ class MemoryStore implements Store {
     const entry = this.alive(key);
     if (entry) entry.expiresAt = Date.now() + seconds * 1000;
   }
+
+  async del(key: string) {
+    this.data.delete(key);
+  }
 }
 
-class RedisStore implements Store {
+/**
+ * Store sobre o Redis (Upstash).
+ *
+ * Exportada para os testes, que injetam um duplo no lugar do cliente real.
+ * O construtor é tipado com o `Redis` de verdade de propósito: é isso que mantém as chamadas
+ * daqui verificadas contra os tipos do pacote (ver o comentário em `set`).
+ */
+export class RedisStore implements Store {
   constructor(private redis: Redis) {}
 
   async get<T>(key: string) {
@@ -89,6 +101,10 @@ class RedisStore implements Store {
 
   async expire(key: string, seconds: number) {
     await this.redis.expire(key, seconds);
+  }
+
+  async del(key: string) {
+    await this.redis.del(key);
   }
 }
 

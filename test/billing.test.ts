@@ -1,12 +1,14 @@
 import assert from "node:assert/strict";
 import { afterEach, beforeEach, test } from "node:test";
-import { asaasConfigFromEnv, AsaasError, createAsaasClient } from "../lib/asaas.js";
-import { createApiKey, effectivePlan, getKeyRecordById, type KeyRecord } from "../lib/auth.js";
+import { asaasConfigFromEnv, AsaasError, createAsaasClient, type AsaasPayment } from "../lib/asaas.js";
+import { createApiKey, effectivePlan, getKeyRecordById, updateKeyPlan, type KeyRecord } from "../lib/auth.js";
 import {
   BillingError,
   cancelSubscription,
+  changePlan,
   getBillingStatus,
   handleAsaasEvent,
+  reconcileSubscription,
   startCheckout,
   todayInBrazil,
   type AsaasEvent,
@@ -14,7 +16,7 @@ import {
 import { createMemoryStore, setStore, type Store } from "../lib/store.js";
 import { POST as webhook } from "../api/webhooks/asaas.js";
 import { POST as checkout } from "../api/v1/billing/checkout.js";
-import { DELETE as cancelEndpoint, GET as statusEndpoint } from "../api/v1/billing/index.js";
+import { DELETE as cancelEndpoint, GET as statusEndpoint, PUT as statusPut } from "../api/v1/billing/index.js";
 import { call, jsonBody, withEnv } from "./helpers.js";
 
 interface FakeCall {
@@ -24,33 +26,137 @@ interface FakeCall {
   body: Record<string, unknown> | undefined;
 }
 
-/** Asaas simulado: responde às rotas usadas pela cobrança e registra o que recebeu. */
-function fakeAsaas(opts: { failCustomer?: boolean } = {}) {
+/**
+ * Asaas simulado, com estado: guarda os clientes e as assinaturas criadas e responde às
+ * consultas por `externalReference` com o que de fato existe.
+ *
+ * O estado é o que dá sentido aos testes de recuperação: um fake sem memória responderia
+ * "nada encontrado" para a consulta que existe justamente para achar a assinatura órfã.
+ */
+function fakeAsaas(
+  opts: {
+    failCustomer?: boolean;
+    /** Cria a assinatura no Asaas e perde a resposta, uma vez: simula timeout após o commit. */
+    dropFirstSubscriptionResponse?: boolean;
+    /** Faz a consulta de assinaturas falhar, para checar que o checkout falha fechando. */
+    failSubscriptionList?: boolean;
+    /** Faz a consulta de clientes falhar, que não deve interromper o checkout. */
+    failCustomerList?: boolean;
+    /** Faz a consulta de cobranças falhar, para checar que o status não quebra. */
+    failPaymentList?: boolean;
+  } = {},
+) {
+  let dropped = false;
+  /** Mutável: permite ligar a falha depois de montar o estado, no meio do teste. */
+  const fail = {
+    subscriptionList: opts.failSubscriptionList ?? false,
+    customerList: opts.failCustomerList ?? false,
+    paymentList: opts.failPaymentList ?? false,
+  };
   const calls: FakeCall[] = [];
+  const customers = new Map<string, { id: string; ref: string; deleted: boolean }>();
+  const subscriptions = new Map<string, { id: string; ref: string; value: number; status: string; deleted: boolean }>();
+  /** Cobranças por assinatura. Cada assinatura nasce com uma PENDING, como no Asaas. */
+  const payments = new Map<string, (AsaasPayment & { value?: number })[]>();
+
   const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
-    const url = String(input);
+    const raw = String(input);
+    const url = new URL(raw);
+    const path = url.pathname.replace(/^\/v3/, "");
+    const ref = url.searchParams.get("externalReference");
     const method = init?.method ?? "GET";
     const headers = { ...(init?.headers as Record<string, string> | undefined) };
     const body = init?.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : undefined;
-    calls.push({ method, url, headers, body });
+    calls.push({ method, url: raw, headers, body });
+
     const respond = (status: number, data: unknown) =>
       new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json" } });
 
-    if (method === "POST" && url.endsWith("/customers")) {
-      return opts.failCustomer
-        ? respond(400, { errors: [{ code: "invalid_customer", description: "CPF/CNPJ inválido" }] })
-        : respond(200, { id: "cus_1" });
+    if (method === "GET" && path === "/customers") {
+      if (fail.customerList) return respond(500, { errors: [] });
+      return respond(200, { data: [...customers.values()].filter((c) => c.ref === ref && !c.deleted) });
     }
-    if (method === "POST" && url.endsWith("/subscriptions")) {
-      return respond(200, { id: "sub_1", status: "ACTIVE", paymentLink: null });
+
+    if (method === "POST" && path === "/customers") {
+      if (opts.failCustomer) {
+        return respond(400, { errors: [{ code: "invalid_customer", description: "CPF/CNPJ inválido" }] });
+      }
+      const id = `cus_${customers.size + 1}`;
+      customers.set(id, { id, ref: String(body?.["externalReference"] ?? ""), deleted: false });
+      return respond(200, { id });
     }
-    if (method === "GET" && url.includes("/subscriptions/sub_1/payments")) {
-      return respond(200, { data: [{ id: "pay_1", status: "PENDING", invoiceUrl: "https://sandbox.asaas.com/i/abc" }] });
+
+    if (method === "GET" && path === "/subscriptions") {
+      if (fail.subscriptionList) return respond(500, { errors: [] });
+      // Fiel ao Asaas: as removidas ficam fora por padrão (só entram com includeDeleted ou
+      // deletedOnly), mas EXPIRED e INACTIVE não são removidas e voltam na listagem. É por
+      // isso que filtrar por status === "ACTIVE" aqui do nosso lado é decisivo, não redundância.
+      return respond(200, { data: [...subscriptions.values()].filter((sub) => sub.ref === ref && !sub.deleted) });
     }
-    if (method === "DELETE" && url.endsWith("/subscriptions/sub_1")) return respond(200, { deleted: true, id: "sub_1" });
-    return respond(404, { errors: [{ code: "not_found", description: "rota inesperada" }] });
+
+    if (method === "POST" && path === "/subscriptions") {
+      const id = `sub_${subscriptions.size + 1}`;
+      subscriptions.set(id, {
+        id,
+        ref: String(body?.["externalReference"] ?? ""),
+        value: Number(body?.["value"] ?? 0),
+        status: "ACTIVE",
+        deleted: false,
+      });
+      payments.set(id, [{ id: `pay_${id}`, status: "PENDING", invoiceUrl: "https://sandbox.asaas.com/i/abc" }]);
+      if (opts.dropFirstSubscriptionResponse && !dropped) {
+        dropped = true;
+        // O Asaas já criou e vai cobrar; só a resposta não chega até nós.
+        throw new TypeError("fetch failed");
+      }
+      return respond(200, { id, status: "ACTIVE", paymentLink: null });
+    }
+
+    const paymentsRoute = path.match(/^\/subscriptions\/([^/]+)\/payments$/);
+    if (method === "GET" && paymentsRoute) {
+      const subId = paymentsRoute[1]!;
+      if (!subscriptions.has(subId)) {
+        return respond(404, { errors: [{ code: "not_found", description: "assinatura inexistente" }] });
+      }
+      if (fail.paymentList) return respond(500, { errors: [] });
+      const wanted = url.searchParams.get("status");
+      const limit = Number(url.searchParams.get("limit") ?? 10);
+      const all = payments.get(subId) ?? [];
+      const filtered = wanted ? all.filter((pay) => pay.status === wanted) : all;
+      return respond(200, { data: filtered.slice(0, limit) });
+    }
+
+    const one = path.match(/^\/subscriptions\/([^/]+)$/);
+    if (method === "PUT" && one) {
+      const sub = subscriptions.get(one[1]!);
+      if (!sub) return respond(404, { errors: [{ code: "not_found", description: "assinatura inexistente" }] });
+      if (typeof body?.["value"] === "number") sub.value = body["value"];
+      // Fiel ao Asaas: sem updatePendingPayments, a cobrança já gerada não muda de valor.
+      if (body?.["updatePendingPayments"] === true) {
+        for (const pay of payments.get(sub.id) ?? []) {
+          if (pay.status === "PENDING") pay.value = sub.value;
+        }
+      }
+      return respond(200, { id: sub.id, status: sub.status, value: sub.value, deleted: sub.deleted });
+    }
+
+    if (method === "DELETE" && one) {
+      const sub = subscriptions.get(one[1]!);
+      if (!sub) return respond(404, { errors: [{ code: "not_found", description: "assinatura inexistente" }] });
+      // Remover no Asaas tem de refletir na consulta: é o que permite contratar de novo.
+      sub.deleted = true;
+      sub.status = "INACTIVE";
+      return respond(200, { deleted: true, id: sub.id });
+    }
+
+    return respond(404, { errors: [{ code: "not_found", description: `rota inesperada: ${method} ${path}` }] });
   }) as typeof fetch;
-  return { fetchImpl, calls };
+
+  /** Chamadas de um método e caminho, para não depender da ordem das requisições. */
+  const callsTo = (method: string, path: string) =>
+    calls.filter((c) => c.method === method && new URL(c.url).pathname.replace(/^\/v3/, "") === path);
+
+  return { fetchImpl, calls, callsTo, customers, subscriptions, payments, fail };
 }
 
 let store: Store;
@@ -74,6 +180,11 @@ const customer = { name: "Maria Souza", document: "52998224725", email: "maria@e
 
 async function newKey(): Promise<{ key: string; record: KeyRecord }> {
   return createApiKey(store, "teste", "free");
+}
+
+/** Cliente do Asaas apontado para um fake. */
+function client(fake: { fetchImpl: typeof fetch }) {
+  return createAsaasClient({ apiKey: "k", baseUrl: "https://x/v3", fetchImpl: fake.fetchImpl });
 }
 
 function paymentEvent(
@@ -137,7 +248,8 @@ test("checkout cria cliente e assinatura mensal e devolve o link da fatura", asy
     price_brl: 49,
     payment_url: "https://sandbox.asaas.com/i/abc",
   });
-  const [createCustomer, createSubscription] = fake.calls;
+  const createCustomer = fake.callsTo("POST", "/customers")[0];
+  const createSubscription = fake.callsTo("POST", "/subscriptions")[0];
   assert.deepEqual(createCustomer?.body, {
     name: "Maria Souza",
     cpfCnpj: "52998224725",
@@ -177,7 +289,585 @@ test("segundo checkout com assinatura ativa → 409; após cancelar, contrata de
   );
 
   await startCheckout({ store, asaas, now: NOW }, record, { plan: "scale", customer });
-  assert.equal(fake.calls.filter((c) => c.url.endsWith("/customers")).length, 1);
+  assert.equal(fake.callsTo("POST", "/customers").length, 1, "o cliente do Asaas é reaproveitado");
+});
+
+// --- troca de plano --------------------------------------------------------
+//
+// O Asaas não faz cobrança proporcional, então não há como acertar a diferença no meio do
+// ciclo. Política: upgrade vale na hora (quem sobe acabou de bater na cota), downgrade vale no
+// próximo pagamento (o período em curso foi pago no plano maior e não há devolução).
+
+/** Chave com assinatura ativa e período pago em vigor no plano informado. */
+async function assinante(fake: ReturnType<typeof fakeAsaas>, plan: "pro" | "scale") {
+  const asaas = client(fake);
+  const { key, record } = await newKey();
+  await startCheckout({ store, asaas, now: NOW }, record, { plan, customer });
+  const until = new Date(NOW.getTime() + 20 * 86_400_000).toISOString();
+  await updateKeyPlan(store, record.id, { plan, planUntil: until });
+  return { asaas, key, record: (await getKeyRecordById(store, record.id))!, until };
+}
+
+test("upgrade vale na hora, mantendo o vencimento já pago", async () => {
+  const fake = fakeAsaas();
+  const { asaas, record, until } = await assinante(fake, "pro");
+
+  const result = await changePlan({ store, asaas, now: NOW }, record, "scale");
+
+  assert.equal(result.changed, true);
+  assert.equal(result.plan, "scale");
+  assert.equal(result.effective_plan, "scale", "o upgrade precisa valer imediatamente");
+  assert.equal(result.price_brl, 249);
+  assert.equal(result.effective_from, NOW.toISOString());
+
+  const depois = (await getKeyRecordById(store, record.id))!;
+  assert.equal(depois.plan, "scale");
+  assert.equal(depois.planUntil, until, "o período pago não muda");
+  assert.equal(fake.subscriptions.get("sub_1")?.value, 249, "o Asaas passa a cobrar o valor novo");
+});
+
+test("depois do upgrade a cota maior já vale nas chamadas", async () => {
+  const fake = fakeAsaas();
+  const { asaas, key, record } = await assinante(fake, "pro");
+  await changePlan({ store, asaas, now: NOW }, record, "scale");
+
+  const res = await call(statusEndpoint, "/v1/billing", key);
+  assert.equal(res.headers.get("x-usage-limit"), "500000", "o limite acompanha o plano em vigor");
+});
+
+test("downgrade não tira o acesso já pago: vale no próximo pagamento", async () => {
+  const fake = fakeAsaas();
+  const { asaas, record, until } = await assinante(fake, "scale");
+
+  const result = await changePlan({ store, asaas, now: NOW }, record, "pro");
+
+  assert.equal(result.changed, true);
+  assert.equal(result.plan, "pro", "o contratado já é o novo");
+  assert.equal(result.effective_plan, "scale", "mas o que vale agora é o que foi pago");
+  assert.equal(result.effective_from, null, "vale no próximo pagamento confirmado");
+
+  const depois = (await getKeyRecordById(store, record.id))!;
+  assert.equal(depois.plan, "scale");
+  assert.equal(depois.planUntil, until);
+  assert.equal(fake.subscriptions.get("sub_1")?.value, 49);
+});
+
+test("o pagamento seguinte ao downgrade aplica o plano novo", async () => {
+  const fake = fakeAsaas();
+  const { asaas, record } = await assinante(fake, "scale");
+  await changePlan({ store, asaas, now: NOW }, record, "pro");
+
+  await handleAsaasEvent(store, paymentEvent("evt_dg", "PAYMENT_CONFIRMED"), NOW);
+
+  const depois = (await getKeyRecordById(store, record.id))!;
+  assert.equal(depois.plan, "pro", "o índice da assinatura é o que grantAccess consulta");
+});
+
+test("upgrade sem período pago não concede plano sem vencimento", async () => {
+  // O caso perigoso: updateKeyPlan sem planUntil apaga o vencimento, o que daria o plano
+  // de graça para sempre. Antecipar só faz sentido havendo período pago para estender.
+  const fake = fakeAsaas();
+  const asaas = client(fake);
+  const { record } = await newKey();
+  await startCheckout({ store, asaas, now: NOW }, record, { plan: "pro", customer });
+
+  const result = await changePlan({ store, asaas, now: NOW }, record, "scale");
+
+  assert.equal(result.effective_plan, "free");
+  assert.equal(result.effective_from, null);
+  const depois = (await getKeyRecordById(store, record.id))!;
+  assert.equal(depois.planUntil, undefined, "não pode virar plano pago sem vencimento");
+  assert.equal(effectivePlan(depois, NOW.getTime()), "free");
+});
+
+test("upgrade com período pago vencido também não antecipa", async () => {
+  const fake = fakeAsaas();
+  const asaas = client(fake);
+  const { record } = await newKey();
+  await startCheckout({ store, asaas, now: NOW }, record, { plan: "pro", customer });
+  await updateKeyPlan(store, record.id, {
+    plan: "pro",
+    planUntil: new Date(NOW.getTime() - 86_400_000).toISOString(),
+  });
+  const vencida = (await getKeyRecordById(store, record.id))!;
+
+  const result = await changePlan({ store, asaas, now: NOW }, vencida, "scale");
+  assert.equal(result.effective_plan, "free", "não há acesso vigente para estender");
+  assert.equal(result.effective_from, null);
+});
+
+test("a cobrança já gerada e não paga passa a valer o preço novo", async () => {
+  const fake = fakeAsaas();
+  const { asaas, record } = await assinante(fake, "pro");
+
+  await changePlan({ store, asaas, now: NOW }, record, "scale");
+
+  const enviado = fake.callsTo("PUT", "/subscriptions/sub_1")[0];
+  assert.equal(enviado?.body?.["updatePendingPayments"], true);
+  assert.equal(enviado?.body?.["value"], 249);
+  assert.match(String(enviado?.body?.["description"]), /scale/);
+  assert.equal(fake.payments.get("sub_1")?.[0]?.value, 249, "quem trocou antes de pagar paga o novo");
+});
+
+test("pedir o plano em que já está responde sucesso sem mexer no Asaas", async () => {
+  const fake = fakeAsaas();
+  const { asaas, record } = await assinante(fake, "pro");
+
+  const result = await changePlan({ store, asaas, now: NOW }, record, "pro");
+
+  assert.equal(result.changed, false);
+  assert.equal(result.plan, "pro");
+  assert.equal(fake.callsTo("PUT", "/subscriptions/sub_1").length, 0, "repetir por timeout não é erro");
+});
+
+test("sem assinatura ativa a troca é 404, apontando o checkout", async () => {
+  const fake = fakeAsaas();
+  const asaas = client(fake);
+  const { record } = await newKey();
+
+  await assert.rejects(
+    () => changePlan({ store, asaas, now: NOW }, record, "scale"),
+    (err: unknown) => err instanceof BillingError && err.status === 404 && /checkout/.test(err.message),
+  );
+});
+
+test("assinatura cancelada não aceita troca de plano", async () => {
+  const fake = fakeAsaas();
+  const { asaas, record } = await assinante(fake, "pro");
+  await cancelSubscription({ store, asaas }, record);
+
+  await assert.rejects(
+    () => changePlan({ store, asaas, now: NOW }, record, "scale"),
+    (err: unknown) => err instanceof BillingError && err.status === 404,
+  );
+});
+
+test("PUT /v1/billing troca o plano e valida a entrada", async () => {
+  restoreEnv = withEnv({ ASAAS_API_KEY: "chave-teste" });
+  const fake = fakeAsaas();
+  globalThis.fetch = fake.fetchImpl;
+  const { key, record } = await newKey();
+  const asaas = client(fake);
+  await startCheckout({ store, asaas, now: NOW }, record, { plan: "pro", customer });
+
+  const put = (body: unknown) =>
+    call(statusPut, "/v1/billing", key, { ...jsonBody(body), method: "PUT" });
+
+  assert.equal((await put({ plan: "free" })).status, 400);
+  assert.equal((await put({ plan: "nope" })).status, 400);
+  assert.equal((await put({})).status, 400);
+
+  const ok = await put({ plan: "scale" });
+  assert.equal(ok.status, 200);
+  assert.equal(((await ok.json()) as { plan: string }).plan, "scale");
+
+  assert.equal((await call(statusPut, "/v1/billing", undefined, { ...jsonBody({ plan: "pro" }), method: "PUT" })).status, 401);
+});
+
+test("a troca de plano não consome cota e funciona com a cota esgotada", async () => {
+  restoreEnv = withEnv({ ASAAS_API_KEY: "chave-teste" });
+  const fake = fakeAsaas();
+  globalThis.fetch = fake.fetchImpl;
+  const { key, record } = await newKey();
+  const asaas = client(fake);
+  await startCheckout({ store, asaas, now: NOW }, record, { plan: "pro", customer });
+  const month = new Date().toISOString().slice(0, 7);
+  await store.set(`usage:${record.id}:${month}`, 1000);
+
+  const res = await call(statusPut, "/v1/billing", key, { ...jsonBody({ plan: "scale" }), method: "PUT" });
+  assert.equal(res.status, 200, "trocar de plano precisa funcionar justamente quando a cota acabou");
+  assert.equal(await store.get(`usage:${record.id}:${month}`), 1000);
+});
+
+// --- recuperação antes de criar --------------------------------------------
+//
+// POST /subscriptions não é idempotente e o Asaas não oferece Idempotency-Key. Se a resposta
+// se perder depois de o Asaas ter criado a assinatura, repetir o checkout criaria a segunda: o
+// cliente seria cobrado duas vezes e o cancelamento só conheceria a última, deixando a
+// primeira cobrando. A defesa é procurar por externalReference antes de criar.
+
+test("resposta perdida: repetir o checkout adota a assinatura em vez de criar a segunda", async () => {
+  const fake = fakeAsaas({ dropFirstSubscriptionResponse: true });
+  const asaas = client(fake);
+  const { record } = await newKey();
+
+  // 1ª tentativa: o Asaas cria, a resposta se perde, o cliente vê erro.
+  await assert.rejects(() => startCheckout({ store, asaas, now: NOW }, record, { plan: "pro", customer }));
+  assert.equal(fake.subscriptions.size, 1, "o Asaas já tem a assinatura");
+  assert.equal(await store.get(`billing:key:${record.id}`), null, "e o nosso lado não sabe dela");
+
+  // 2ª tentativa: o cliente repete, como qualquer um faria.
+  const result = await startCheckout({ store, asaas, now: NOW }, record, { plan: "pro", customer });
+
+  assert.equal(fake.subscriptions.size, 1, "não pode existir uma segunda assinatura cobrando");
+  assert.equal(result.subscription_id, "sub_1", "a resposta aponta para a que já existe");
+  assert.equal(
+    fake.callsTo("POST", "/subscriptions").length,
+    1,
+    "o POST só aconteceu na 1ª tentativa; a 2ª resolveu pela consulta",
+  );
+});
+
+test("a assinatura adotada aparece no status e pode ser cancelada", async () => {
+  const fake = fakeAsaas({ dropFirstSubscriptionResponse: true });
+  const asaas = client(fake);
+  const { record } = await newKey();
+
+  await assert.rejects(() => startCheckout({ store, asaas, now: NOW }, record, { plan: "pro", customer }));
+  await startCheckout({ store, asaas, now: NOW }, record, { plan: "pro", customer });
+
+  const status = await getBillingStatus({ store, asaas }, record);
+  assert.equal(status.subscription?.id, "sub_1");
+  assert.equal(status.subscription?.status, "active");
+
+  // O essencial: o cliente consegue se livrar da cobrança sozinho.
+  await cancelSubscription({ store, asaas }, record);
+  assert.equal(fake.subscriptions.get("sub_1")?.deleted, true, "a cobrança precisa cessar no Asaas");
+});
+
+test("órfã de outro plano é adotada e devolve 409, para poder ser cancelada", async () => {
+  const fake = fakeAsaas({ dropFirstSubscriptionResponse: true });
+  const asaas = client(fake);
+  const { record } = await newKey();
+
+  await assert.rejects(() => startCheckout({ store, asaas, now: NOW }, record, { plan: "pro", customer }));
+
+  // Agora o cliente tenta outro plano, sem saber que a anterior ficou criada.
+  await assert.rejects(
+    () => startCheckout({ store, asaas, now: NOW }, record, { plan: "scale", customer }),
+    (err: unknown) => err instanceof BillingError && err.status === 409 && err.code === "subscription_exists",
+  );
+
+  assert.equal(fake.subscriptions.size, 1, "a recusa não pode criar nada");
+  const status = await getBillingStatus({ store, asaas }, record);
+  assert.equal(status.subscription?.id, "sub_1", "mesmo recusando, a órfã tem de ficar visível");
+  assert.equal(status.subscription?.plan, "pro", "o plano vem do valor cobrado de verdade");
+});
+
+test("órfã com valor fora dos planos atuais vira conflito explícito", async () => {
+  const fake = fakeAsaas();
+  const asaas = client(fake);
+  const { record } = await newKey();
+  // Assinatura ativa no Asaas por um preço que não é de nenhum plano (ex.: preço antigo).
+  fake.subscriptions.set("sub_9", { id: "sub_9", ref: record.id, value: 17, status: "ACTIVE", deleted: false });
+
+  await assert.rejects(
+    () => startCheckout({ store, asaas, now: NOW }, record, { plan: "pro", customer }),
+    (err: unknown) =>
+      err instanceof BillingError && err.status === 409 && err.code === "subscription_conflict" && /sub_9/.test(err.message),
+  );
+  assert.equal(fake.callsTo("POST", "/subscriptions").length, 0, "não adivinha o plano nem cria outra");
+});
+
+test("se a consulta de assinaturas falha, o checkout falha fechando", async () => {
+  const fake = fakeAsaas({ failSubscriptionList: true });
+  const asaas = client(fake);
+  const { record } = await newKey();
+
+  await assert.rejects(() => startCheckout({ store, asaas, now: NOW }, record, { plan: "pro", customer }));
+  assert.equal(fake.callsTo("POST", "/subscriptions").length, 0, "sem poder consultar, criar arriscaria cobrar duas vezes");
+  assert.equal(fake.callsTo("POST", "/customers").length, 0);
+});
+
+test("cliente já existente no Asaas é reaproveitado, sem duplicar", async () => {
+  const fake = fakeAsaas();
+  const asaas = client(fake);
+  const { record } = await newKey();
+  // Cliente criado numa tentativa anterior cuja gravação local não aconteceu.
+  fake.customers.set("cus_7", { id: "cus_7", ref: record.id, deleted: false });
+
+  await startCheckout({ store, asaas, now: NOW }, record, { plan: "pro", customer });
+
+  assert.equal(fake.callsTo("POST", "/customers").length, 0, "não cria um segundo cliente para o mesmo CPF");
+  assert.equal(fake.callsTo("POST", "/subscriptions")[0]?.body?.["customer"], "cus_7");
+  assert.equal(await store.get(`billing:customer:${record.id}`), "cus_7", "e passa a ficar em cache");
+});
+
+test("falha na consulta de clientes não interrompe: cliente duplicado não cobra ninguém", async () => {
+  const fake = fakeAsaas({ failCustomerList: true });
+  const asaas = client(fake);
+  const { record } = await newKey();
+
+  const result = await startCheckout({ store, asaas, now: NOW }, record, { plan: "pro", customer });
+  assert.equal(result.subscription_id, "sub_1");
+  assert.equal(fake.callsTo("POST", "/customers").length, 1, "segue adiante e cria");
+});
+
+test("assinatura removida no Asaas não é adotada: contratar de novo continua possível", async () => {
+  const fake = fakeAsaas();
+  const asaas = client(fake);
+  const { record } = await newKey();
+
+  await startCheckout({ store, asaas, now: NOW }, record, { plan: "pro", customer });
+  await cancelSubscription({ store, asaas }, record);
+
+  const again = await startCheckout({ store, asaas, now: NOW }, record, { plan: "scale", customer });
+  assert.equal(again.subscription_id, "sub_2", "a cancelada não pode ser readotada");
+  assert.equal(again.plan, "scale");
+});
+
+// --- reconciliação ---------------------------------------------------------
+//
+// O webhook é o único caminho que libera acesso, e ele falha de formas silenciosas: o Asaas
+// pausa a fila após 15 falhas seguidas, um deploy ruim perde eventos. O cliente fica sem o
+// acesso que pagou. A reconciliação reconstrói o direito a partir das cobranças.
+
+/** Assinatura ativa e paga no Asaas, mas com a chave sem acesso: o evento se perdeu. */
+async function lostEventState(fake: ReturnType<typeof fakeAsaas>) {
+  const asaas = client(fake);
+  const { key, record } = await newKey();
+  await startCheckout({ store, asaas, now: NOW }, record, { plan: "pro", customer });
+  // O Asaas confirmou a cobrança; o nosso lado nunca soube.
+  fake.payments.set("sub_1", [
+    { id: "pay_1", status: "CONFIRMED", dueDate: "2026-10-15", paymentDate: "2026-10-15" },
+  ]);
+  const fresh = (await getKeyRecordById(store, record.id))!;
+  assert.equal(effectivePlan(fresh), "free", "a chave começa sem acesso pago");
+  return { asaas, key, record: fresh };
+}
+
+test("evento perdido: consultar o status reconstrói o acesso pago", async () => {
+  const fake = fakeAsaas();
+  const { asaas, record } = await lostEventState(fake);
+
+  const status = await getBillingStatus({ store, asaas }, record);
+
+  assert.equal(status.plan, "pro", "o acesso pago precisa voltar sem depender de evento");
+  assert.ok(status.plan_until);
+  const after = (await getKeyRecordById(store, record.id))!;
+  assert.equal(effectivePlan(after), "pro", "e ficar gravado, não só aparecer na resposta");
+});
+
+test("a reconciliação chega ao mesmo planUntil que o webhook teria gravado", async () => {
+  // A regra de direito ao acesso é uma só (paidUntil); duas implementações divergiriam.
+  const viaReconcile = await (async () => {
+    const fake = fakeAsaas();
+    const { asaas, record } = await lostEventState(fake);
+    await getBillingStatus({ store, asaas }, record);
+    return (await getKeyRecordById(store, record.id))!.planUntil;
+  })();
+
+  store = createMemoryStore();
+  setStore(store);
+
+  const viaWebhook = await (async () => {
+    const fake = fakeAsaas();
+    const asaas = client(fake);
+    const { record } = await newKey();
+    await startCheckout({ store, asaas, now: NOW }, record, { plan: "pro", customer });
+    await handleAsaasEvent(
+      store,
+      paymentEvent("evt_1", "PAYMENT_CONFIRMED", { dueDate: "2026-10-15", dateCreated: "2026-10-15 10:00:00" }),
+      NOW,
+    );
+    return (await getKeyRecordById(store, record.id))!.planUntil;
+  })();
+
+  // Não dá para serem idênticos: o evento traz `dateCreated` com hora, a cobrança traz só a
+  // data da confirmação. A regra (paidUntil) é uma só; a precisão da entrada é que difere.
+  // O invariante que importa é a direção: reconciliar nunca concede MENOS que o webhook, já
+  // que o evento se perdeu por falha nossa.
+  assert.ok(viaReconcile && viaWebhook);
+  assert.ok(
+    Date.parse(viaReconcile) >= Date.parse(viaWebhook),
+    `reconciliação (${viaReconcile}) não pode ficar antes do webhook (${viaWebhook})`,
+  );
+  assert.equal(viaReconcile.slice(0, 10), viaWebhook.slice(0, 10), "e cai no mesmo dia");
+});
+
+test("reconciliar é idempotente: repetir não muda o resultado", async () => {
+  const fake = fakeAsaas();
+  const { asaas, record } = await lostEventState(fake);
+
+  await getBillingStatus({ store, asaas }, record);
+  const primeiro = (await getKeyRecordById(store, record.id))!.planUntil;
+  const atualizada = (await getKeyRecordById(store, record.id))!;
+  await getBillingStatus({ store, asaas }, atualizada);
+  assert.equal((await getKeyRecordById(store, record.id))!.planUntil, primeiro);
+});
+
+test("só estende: não encurta um período pago já concedido", async () => {
+  // Exercita reconcileSubscription direto: pelo GET o gate exige acesso vencido, e um
+  // planUntil futuro faria a reconciliação nem rodar — o teste passaria sem testar nada.
+  const fake = fakeAsaas();
+  const { asaas, record } = await lostEventState(fake);
+
+  // Já concedido até depois do que a cobrança de 15/10 justifica, mas ainda no passado,
+  // para o estado continuar sendo o de "sem acesso pago vigente".
+  const concedido = new Date("2026-12-31T00:00:00.000Z").toISOString();
+  await updateKeyPlan(store, record.id, { plan: "pro", planUntil: concedido });
+  const atual = (await getKeyRecordById(store, record.id))!;
+
+  const result = await reconcileSubscription({ store, asaas, now: NOW }, atual);
+
+  assert.equal(result.plan_until, null, "não há o que estender");
+  assert.equal((await getKeyRecordById(store, record.id))!.planUntil, concedido);
+});
+
+test("estende quando a cobrança justifica mais do que já havia", async () => {
+  const fake = fakeAsaas();
+  const { asaas, record } = await lostEventState(fake);
+  const curto = new Date("2026-10-20T00:00:00.000Z").toISOString();
+  await updateKeyPlan(store, record.id, { plan: "pro", planUntil: curto });
+  const atual = (await getKeyRecordById(store, record.id))!;
+
+  const result = await reconcileSubscription({ store, asaas, now: NOW }, atual);
+
+  assert.ok(result.plan_until);
+  assert.ok(Date.parse(result.plan_until) > Date.parse(curto));
+});
+
+test("falha ao consultar assinaturas não marca a assinatura como cancelada", async () => {
+  // Marcar por causa de uma falha de rede liberaria um segundo checkout — exatamente a
+  // cobrança dupla que findActiveSubscription existe para evitar.
+  const fake = fakeAsaas();
+  const { asaas, record } = await lostEventState(fake);
+  fake.fail.subscriptionList = true;
+
+  const result = await reconcileSubscription({ store, asaas, now: NOW }, record);
+
+  assert.equal(result.subscription_cancelled, false);
+  const billing = await store.get<{ status: string }>(`billing:key:${record.id}`);
+  assert.equal(billing?.status, "active", "na dúvida, mantém como está");
+});
+
+test("cobrança estornada não dá direito a acesso", async () => {
+  const fake = fakeAsaas();
+  const { asaas, record } = await lostEventState(fake);
+  fake.payments.set("sub_1", [{ id: "pay_1", status: "REFUNDED", dueDate: "2026-10-15", paymentDate: "2026-10-15" }]);
+
+  const status = await getBillingStatus({ store, asaas }, record);
+  assert.equal(status.plan, "free");
+  assert.equal(status.plan_until, null);
+});
+
+test("no caminho saudável não consulta as cobranças à toa", async () => {
+  const fake = fakeAsaas();
+  const asaas = client(fake);
+  const { record } = await newKey();
+  await startCheckout({ store, asaas, now: NOW }, record, { plan: "pro", customer });
+  await updateKeyPlan(store, record.id, {
+    plan: "pro",
+    planUntil: new Date(NOW.getTime() + 20 * 86_400_000).toISOString(),
+  });
+
+  const saudavel = (await getKeyRecordById(store, record.id))!;
+  const antes = fake.callsTo("GET", "/subscriptions/sub_1/payments").length;
+  await getBillingStatus({ store, asaas }, saudavel);
+  const depois = fake.callsTo("GET", "/subscriptions/sub_1/payments").length;
+
+  // Uma única chamada, a do link pendente, que já existia antes da reconciliação.
+  assert.equal(depois - antes, 1, "acesso pago vigente não precisa de reconciliação");
+});
+
+test("assinatura removida no painel do Asaas é marcada como cancelada", async () => {
+  const fake = fakeAsaas();
+  const asaas = client(fake);
+  const { record } = await newKey();
+  await startCheckout({ store, asaas, now: NOW }, record, { plan: "pro", customer });
+  // Cancelada direto no Asaas, sem o evento chegar até nós.
+  fake.subscriptions.get("sub_1")!.deleted = true;
+  fake.subscriptions.get("sub_1")!.status = "INACTIVE";
+
+  const status = await getBillingStatus({ store, asaas }, record);
+  assert.equal(status.subscription?.status, "cancelled");
+
+  // E o principal: contratar de novo volta a ser possível.
+  const novo = await startCheckout({ store, asaas, now: NOW }, record, { plan: "pro", customer });
+  assert.equal(novo.subscription_id, "sub_2");
+});
+
+test("falha ao reconciliar não derruba a consulta de status", async () => {
+  const fake = fakeAsaas({ failPaymentList: true });
+  const asaas = client(fake);
+  const { record } = await newKey();
+  await startCheckout({ store, asaas, now: NOW }, record, { plan: "pro", customer });
+
+  const status = await getBillingStatus({ store, asaas }, record);
+  assert.equal(status.plan, "free", "status é leitura: responde com o que sabe");
+  assert.equal(status.subscription?.id, "sub_1");
+});
+
+test("sem assinatura não há o que reconciliar", async () => {
+  const fake = fakeAsaas();
+  const asaas = client(fake);
+  const { record } = await newKey();
+
+  const status = await getBillingStatus({ store, asaas }, record);
+  assert.equal(status.subscription, null);
+  assert.equal(fake.calls.length, 0, "nem chega a falar com o Asaas");
+});
+
+test("assinatura EXPIRED ou INACTIVE não é adotada, apesar de não estar removida", async () => {
+  // O Asaas exclui as removidas da listagem por padrão, mas EXPIRED e INACTIVE voltam nela.
+  // Adotá-las daria ao cliente uma assinatura que não cobra mais nada.
+  for (const status of ["EXPIRED", "INACTIVE"]) {
+    store = createMemoryStore();
+    setStore(store);
+    const fake = fakeAsaas();
+    const asaas = client(fake);
+    const { record } = await newKey();
+    fake.subscriptions.set("sub_velha", { id: "sub_velha", ref: record.id, value: 49, status, deleted: false });
+
+    const result = await startCheckout({ store, asaas, now: NOW }, record, { plan: "pro", customer });
+    assert.notEqual(result.subscription_id, "sub_velha", `${status} não pode ser adotada`);
+    assert.equal(fake.callsTo("POST", "/subscriptions").length, 1, `${status} tem de levar a criar uma nova`);
+  }
+});
+
+test("cobrança recuperada por negativação dá direito ao acesso", async () => {
+  // DUNNING_RECEIVED é dinheiro recebido: chega atrasado, mas é pagamento.
+  const fake = fakeAsaas();
+  const asaas = client(fake);
+  const { record } = await newKey();
+  await startCheckout({ store, asaas, now: NOW }, record, { plan: "pro", customer });
+  fake.payments.set("sub_1", [
+    { id: "pay_1", status: "DUNNING_RECEIVED", dueDate: "2026-09-10", paymentDate: "2026-10-14" },
+  ]);
+
+  const status = await getBillingStatus({ store, asaas }, record);
+  assert.equal(status.plan, "pro");
+});
+
+test("o webhook também libera acesso com PAYMENT_DUNNING_RECEIVED", async () => {
+  const fake = fakeAsaas();
+  const asaas = client(fake);
+  const { record } = await newKey();
+  await startCheckout({ store, asaas, now: NOW }, record, { plan: "pro", customer });
+
+  const outcome = await handleAsaasEvent(store, paymentEvent("evt_d", "PAYMENT_DUNNING_RECEIVED"), NOW);
+  assert.equal(outcome, "processed");
+  assert.equal(effectivePlan((await getKeyRecordById(store, record.id))!, NOW.getTime()), "pro");
+});
+
+test("status de cobrança sem dinheiro recebido não dá acesso", async () => {
+  for (const status of ["PENDING", "OVERDUE", "REFUND_REQUESTED", "CHARGEBACK_REQUESTED", "AWAITING_RISK_ANALYSIS"]) {
+    store = createMemoryStore();
+    setStore(store);
+    const fake = fakeAsaas();
+    const asaas = client(fake);
+    const { record } = await newKey();
+    await startCheckout({ store, asaas, now: NOW }, record, { plan: "pro", customer });
+    fake.payments.set("sub_1", [{ id: "pay_1", status, dueDate: "2026-10-15", paymentDate: "2026-10-15" }]);
+
+    const result = await getBillingStatus({ store, asaas }, record);
+    assert.equal(result.plan, "free", `${status} não pode liberar acesso`);
+  }
+});
+
+test("usa paymentDate, e clientPaymentDate quando o primeiro não vem", async () => {
+  const fake = fakeAsaas();
+  const asaas = client(fake);
+  const { record } = await newKey();
+  await startCheckout({ store, asaas, now: NOW }, record, { plan: "pro", customer });
+  // Sem paymentDate: o Asaas pode trazer só a data em que o cliente quitou.
+  fake.payments.set("sub_1", [
+    { id: "pay_1", status: "RECEIVED", dueDate: "2026-10-15", clientPaymentDate: "2026-10-15" },
+  ]);
+
+  const status = await getBillingStatus({ store, asaas }, record);
+  assert.equal(status.plan, "pro");
+  assert.ok(status.plan_until);
 });
 
 // --- webhook: lógica -------------------------------------------------------
@@ -336,8 +1026,9 @@ test("checkout pelo endpoint: 201 com link, não gasta cota e funciona com a cot
   const res = await call(checkout, "/v1/billing/checkout", key, jsonBody({ plan: "pro", customer: { ...customer, document: "529.982.247-25" } }));
   assert.equal(res.status, 201);
   assert.equal(((await res.json()) as { payment_url: string }).payment_url, "https://sandbox.asaas.com/i/abc");
-  assert.equal(fake.calls[0]?.body?.["cpfCnpj"], "52998224725");
-  assert.equal(fake.calls[0]?.headers["access_token"], "chave-teste");
+  const sentCustomer = fake.callsTo("POST", "/customers")[0];
+  assert.equal(sentCustomer?.body?.["cpfCnpj"], "52998224725");
+  assert.equal(sentCustomer?.headers["access_token"], "chave-teste");
   assert.equal(await store.get(`usage:${record.id}:${month}`), 1000);
 
   const again = await call(checkout, "/v1/billing/checkout", key, jsonBody({ plan: "pro", customer }));

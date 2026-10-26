@@ -17,7 +17,20 @@ export interface AsaasPayment {
   id: string;
   status?: string;
   invoiceUrl?: string;
+  /** AAAA-MM-DD. */
   dueDate?: string;
+  /** AAAA-MM-DD. Quando a cobrança foi paga no sistema do Asaas. */
+  paymentDate?: string;
+  /** AAAA-MM-DD. Quando o cliente efetivamente quitou (pode ser anterior ao paymentDate). */
+  clientPaymentDate?: string;
+}
+
+export interface AsaasSubscription {
+  id: string;
+  status?: string;
+  /** Mensalidade cobrada. Serve para reconhecer o plano de uma assinatura órfã. */
+  value?: number;
+  deleted?: boolean;
 }
 
 export class AsaasError extends Error {
@@ -90,13 +103,42 @@ export function createAsaasClient(config: AsaasConfig) {
       return request<{ id: string; status?: string; paymentLink?: string | null }>("POST", "/subscriptions", input);
     },
 
+    /**
+     * Altera uma assinatura. `updatePendingPayments` aplica a mudança também às cobranças já
+     * geradas e não pagas; sem ele (padrão do Asaas) o valor novo só vale para as futuras.
+     */
+    updateSubscription(
+      id: string,
+      input: { value?: number; description?: string; updatePendingPayments?: boolean },
+    ) {
+      return request<AsaasSubscription>("PUT", `/subscriptions/${encodeURIComponent(id)}`, input);
+    },
+
     deleteSubscription(id: string) {
       return request<unknown>("DELETE", `/subscriptions/${encodeURIComponent(id)}`);
     },
 
-    listSubscriptionPayments(id: string, status?: string) {
-      const query = status ? `?status=${encodeURIComponent(status)}` : "";
+    listSubscriptionPayments(id: string, opts: { status?: string; limit?: number } = {}) {
+      const params = new URLSearchParams();
+      if (opts.status) params.set("status", opts.status);
+      if (opts.limit !== undefined) params.set("limit", String(opts.limit));
+      const query = params.size > 0 ? `?${params}` : "";
       return request<{ data?: AsaasPayment[] }>("GET", `/subscriptions/${encodeURIComponent(id)}/payments${query}`);
+    },
+
+    /**
+     * Assinaturas com um `externalReference`. É o caminho de reconciliação recomendado pela
+     * documentação do Asaas, e o que permite achar uma assinatura criada numa tentativa cuja
+     * resposta se perdeu.
+     */
+    listSubscriptions(externalReference: string) {
+      const query = `?externalReference=${encodeURIComponent(externalReference)}`;
+      return request<{ data?: AsaasSubscription[] }>("GET", `/subscriptions${query}`);
+    },
+
+    listCustomers(externalReference: string) {
+      const query = `?externalReference=${encodeURIComponent(externalReference)}`;
+      return request<{ data?: { id?: string; deleted?: boolean }[] }>("GET", `/customers${query}`);
     },
   };
 }

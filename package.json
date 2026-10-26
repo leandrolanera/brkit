@@ -8,7 +8,8 @@
     "dev": "vercel dev",
     "typecheck": "tsc --noEmit",
     "test": "node --import tsx --test \"test/**/*.test.ts\"",
-    "create-key": "tsx scripts/create-key.ts"
+    "create-key": "tsx scripts/create-key.ts",
+    "verify": "tsx scripts/verify-live.ts"
   },
   "dependencies": {
     "@upstash/redis": "^1.34.0",

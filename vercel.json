@@ -1,5 +1,6 @@
 {
   "rewrites": [
+    { "source": "/v1/openapi.json", "destination": "/api/v1/openapi" },
     { "source": "/v1/:path*", "destination": "/api/v1/:path*" },
     { "source": "/r/:id", "destination": "/api/redirect?id=:id" }
   ]
