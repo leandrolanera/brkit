@@ -11,7 +11,7 @@ import {
 import { decodePayment } from "../lib/payments.js";
 import { buildBrCode, parseBrCode } from "../lib/pix.js";
 import { createMemoryStore, setStore, type Store } from "../lib/store.js";
-import { POST as paymentsDecode } from "../api/v1/payments/decode.js";
+import { POST as paymentsDecode } from "../handlers/v1/payments/decode.js";
 import { call, jsonBody } from "./helpers.js";
 
 let store: Store;

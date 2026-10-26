@@ -14,9 +14,9 @@ import {
   type AsaasEvent,
 } from "../lib/billing.js";
 import { createMemoryStore, setStore, type Store } from "../lib/store.js";
-import { POST as webhook } from "../api/webhooks/asaas.js";
-import { POST as checkout } from "../api/v1/billing/checkout.js";
-import { DELETE as cancelEndpoint, GET as statusEndpoint, PUT as statusPut } from "../api/v1/billing/index.js";
+import { POST as webhook } from "../handlers/webhooks/asaas.js";
+import { POST as checkout } from "../handlers/v1/billing/checkout.js";
+import { DELETE as cancelEndpoint, GET as statusEndpoint, PUT as statusPut } from "../handlers/v1/billing/index.js";
 import { call, jsonBody, withEnv } from "./helpers.js";
 
 interface FakeCall {

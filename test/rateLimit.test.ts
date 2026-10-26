@@ -5,7 +5,7 @@ import { clientIp } from "../lib/http.js";
 import { rateLimitPerMinute } from "../lib/rateLimit.js";
 import { createMemoryStore, setStore, type Store } from "../lib/store.js";
 import { createDynamicCode, scanCount } from "../lib/qr.js";
-import { GET as redirect } from "../api/redirect.js";
+import { GET as redirect } from "../handlers/redirect.js";
 
 let store: Store;
 

@@ -4,8 +4,8 @@ import { createApiKey } from "../lib/auth.js";
 import { accessKeyCheckDigit, buildAccessKey, NfeError, normalizeAccessKey, parseAccessKey } from "../lib/nfe.js";
 import { createMemoryStore, setStore, type Store } from "../lib/store.js";
 import { isValidCnpj } from "../lib/validators.js";
-import { POST as nfeDecode } from "../api/v1/nfe/decode.js";
-import { POST as nfeKey } from "../api/v1/nfe/key.js";
+import { POST as nfeDecode } from "../handlers/v1/nfe/decode.js";
+import { POST as nfeKey } from "../handlers/v1/nfe/key.js";
 import { call, jsonBody } from "./helpers.js";
 
 let store: Store;

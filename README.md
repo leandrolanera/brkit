@@ -118,7 +118,7 @@ O spec é **construído em TypeScript** (`lib/openapi.ts`), não escrito como JS
 - Os limites documentados saem das mesmas constantes que o código aplica (`PLANS`, `LIMITS` do Pix). Mudar a cota muda a documentação.
 - **Os exemplos são gerados pelas mesmas funções que os endpoints usam.** O BR Code do exemplo é um Pix válido, a linha digitável tem todos os dígitos verificadores corretos, a lista de feriados é a que a API devolve. Exemplo errado na documentação custa caro: quem lê copia, não funciona, e passa a desconfiar do resto — então há teste decodificando cada um.
 - Cada endpoint de produto declara **"Quando usar"**, e há teste conferindo que nenhum entra sem isso.
-- Os testes conferem cobertura **nos dois sentidos**: toda rota exportada em `api/` precisa estar no spec, e todo caminho do spec precisa existir como rota. Endpoint novo sem documentação quebra a suíte, e documentação de rota removida também.
+- Os testes conferem cobertura **nos dois sentidos**: toda rota exportada em `handlers/` precisa estar no spec, e todo caminho do spec precisa existir como rota. Endpoint novo sem documentação quebra a suíte, e documentação de rota removida também.
 - O webhook do Asaas é excluído de propósito (quem chama é o provedor, não clientes). A exclusão é uma lista explícita e testada: se a rota deixar de existir, o teste avisa que o motivo registrado ficou obsoleto.
 - Outras conferências: todo `$ref` resolve, nenhum schema fica órfão, `operationId` é único, rota pública declara `security: []` (sem isso a doc pediria chave de quem está tentando obtê-la), e endpoint que consome cota documenta o 402 — e quem não consome, não documenta.
 
@@ -278,7 +278,9 @@ curl -H "x-api-key: ak_live_..." "https://brkit.dev/v1/billing"
 ## Estrutura
 
 ```
-api/            endpoints (um arquivo por rota, handlers no padrão Web Request/Response)
+api/            entrada única da Vercel (index.ts)
+handlers/       endpoints no padrão Web Request/Response
+lib/router.ts   roteamento interno das URLs públicas e /api/*
   v1/
   webhooks/asaas.ts   webhook do Asaas
   redirect.ts         rota pública do QR dinâmico
@@ -358,3 +360,7 @@ Lista mantida em ordem de prioridade. O que está em "verificação externa" nã
 9. **Paginação nas consultas ao Asaas.** O limite de 100 por página cobre mais de 8 anos de assinatura mensal, mas não é infinito.
 10. **HTML → PDF e screenshot.** Precisa de Chromium headless: avaliar a Vercel com build compacto ou uma VPS pequena. É projeto, não tarefa.
 11. **Créditos pré-pagos**, necessários antes de qualquer endpoint com IA. O gancho já existe em `withApi(handler, { cost: N })`.
+
+### Funções no plano Hobby
+
+O deploy usa somente `api/index.ts`, que encaminha as requisições pelo pathname em `lib/router.ts`. Os 23 módulos de endpoints ficam em `handlers/`, fora de `api/`, para respeitar o limite de 12 funções do Hobby. Adicione novos endpoints em `handlers/` e registre-os no roteador; não crie novas funções em `api/`. As URLs `/v1/*`, `/r/:id` e `/api/*` continuam disponíveis pelos rewrites.

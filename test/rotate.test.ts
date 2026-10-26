@@ -3,11 +3,11 @@ import { afterEach, beforeEach, describe, test } from "node:test";
 import { createApiKey, lookupKey, rotateApiKey, updateKeyPlan } from "../lib/auth.js";
 import { startRecovery, startSignup, verifyRecovery, verifySignup, SignupError } from "../lib/signup.js";
 import { createMemoryStore, setStore, type Store } from "../lib/store.js";
-import { POST as rotate } from "../api/v1/keys/rotate.js";
-import { POST as recover } from "../api/v1/keys/recover/index.js";
-import { POST as recoverVerify } from "../api/v1/keys/recover/verify.js";
-import { GET as holidays } from "../api/v1/holidays/index.js";
-import { POST as qrPost, GET as qrGet } from "../api/v1/qr/codes.js";
+import { POST as rotate } from "../handlers/v1/keys/rotate.js";
+import { POST as recover } from "../handlers/v1/keys/recover/index.js";
+import { POST as recoverVerify } from "../handlers/v1/keys/recover/verify.js";
+import { GET as holidays } from "../handlers/v1/holidays/index.js";
+import { POST as qrPost, GET as qrGet } from "../handlers/v1/qr/codes.js";
 import { call, jsonBody, withEnv } from "./helpers.js";
 
 let store: Store;
@@ -373,7 +373,7 @@ describe("endpoints de recuperação", () => {
   test("o limite da recuperação é separado do limite do cadastro", async () => {
     restoreEnv = withEnv({ RESEND_API_KEY: "re_x", EMAIL_FROM: "a@b.c" });
     globalThis.fetch = (async () => new Response(JSON.stringify({ id: "e" }), { status: 200 })) as typeof fetch;
-    const { POST: signupPost } = await import("../api/v1/signup/index.js");
+    const { POST: signupPost } = await import("../handlers/v1/signup/index.js");
     await cadastrar();
 
     // Esgota o limite da recuperação para este e-mail.

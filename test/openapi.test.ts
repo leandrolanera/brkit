@@ -8,7 +8,7 @@ import { parseBrCode } from "../lib/pix.js";
 import { LIMITS as PIX_LIMITS } from "../lib/pix.js";
 import { holidaysForYear } from "../lib/holidays.js";
 import { PLANS } from "../lib/plans.js";
-import { GET as openapiEndpoint } from "../api/v1/openapi.js";
+import { GET as openapiEndpoint } from "../handlers/v1/openapi.js";
 import { withEnv } from "./helpers.js";
 
 let restoreEnv: () => void = () => {};
@@ -34,13 +34,13 @@ const NOT_PUBLIC: Record<string, string> = {
 
 /** Converte o caminho do arquivo em caminho de URL, como fazem as reescritas da Vercel. */
 function urlPathFor(file: string): string {
-  if (file === "api/redirect.ts") return "/r/{id}"; // reescrito em vercel.json
+  if (file === "handlers/redirect.ts") return "/r/{id}"; // reescrito em vercel.json
   const withoutExt = file.replace(/\.ts$/, "");
   const withoutIndex = withoutExt.replace(/\/index$/, "");
-  return `/${withoutIndex.replace(/^api\//, "")}`.replace(/^\/v1/, "/v1");
+  return `/${withoutIndex.replace(/^handlers\//, "")}`.replace(/^\/v1/, "/v1");
 }
 
-function listHandlerFiles(dir = "api"): string[] {
+function listHandlerFiles(dir = "handlers"): string[] {
   return readdirSync(dir).flatMap((entry) => {
     const full = join(dir, entry);
     if (statSync(full).isDirectory()) return listHandlerFiles(full);
@@ -58,7 +58,7 @@ async function actualRoutes(): Promise<Map<string, Set<string>>> {
       HTTP_METHODS.filter((m) => typeof mod[m.toUpperCase()] === "function").map((m) => m),
     );
     if (methods.size === 0) continue;
-    const url = file === "api/webhooks/asaas.ts" ? "/api/webhooks/asaas" : urlPathFor(file);
+    const url = file === "handlers/webhooks/asaas.ts" ? "/api/webhooks/asaas" : urlPathFor(file);
     routes.set(url, methods);
   }
   return routes;

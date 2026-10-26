@@ -12,7 +12,7 @@ import {
   mod11Cobranca,
 } from "../lib/boleto.js";
 import { createMemoryStore, setStore, type Store } from "../lib/store.js";
-import { POST as boletoDecode } from "../api/v1/boleto/decode.js";
+import { POST as boletoDecode } from "../handlers/v1/boleto/decode.js";
 import { call, jsonBody } from "./helpers.js";
 
 let store: Store;

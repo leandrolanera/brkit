@@ -2,9 +2,9 @@ import assert from "node:assert/strict";
 import { beforeEach, test } from "node:test";
 import { createApiKey } from "../lib/auth.js";
 import { createMemoryStore, setStore, type Store } from "../lib/store.js";
-import { GET as qrStatic } from "../api/v1/qr/index.js";
-import { GET as qrGet, PATCH as qrPatch, POST as qrPost } from "../api/v1/qr/codes.js";
-import { GET as redirect } from "../api/redirect.js";
+import { GET as qrStatic } from "../handlers/v1/qr/index.js";
+import { GET as qrGet, PATCH as qrPatch, POST as qrPost } from "../handlers/v1/qr/codes.js";
+import { GET as redirect } from "../handlers/redirect.js";
 import { call, jsonBody } from "./helpers.js";
 
 let store: Store;

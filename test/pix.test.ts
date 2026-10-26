@@ -11,8 +11,8 @@ import {
   sanitizeText,
 } from "../lib/pix.js";
 import { createMemoryStore, setStore, type Store } from "../lib/store.js";
-import { POST as pixQr } from "../api/v1/pix/qr.js";
-import { POST as pixDecode } from "../api/v1/pix/decode.js";
+import { POST as pixQr } from "../handlers/v1/pix/qr.js";
+import { POST as pixDecode } from "../handlers/v1/pix/decode.js";
 import { call, jsonBody } from "./helpers.js";
 
 let store: Store;

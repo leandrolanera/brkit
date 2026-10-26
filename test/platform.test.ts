@@ -3,10 +3,10 @@ import { beforeEach, test } from "node:test";
 import { createApiKey, effectivePlan, updateKeyPlan } from "../lib/auth.js";
 import { createMemoryStore, setStore, type Store } from "../lib/store.js";
 import { withApi } from "../lib/withApi.js";
-import { GET as holidays } from "../api/v1/holidays/index.js";
-import { GET as businessDays } from "../api/v1/holidays/business-days.js";
-import { POST as cpf } from "../api/v1/validate/cpf.js";
-import { GET as cnpjGet } from "../api/v1/validate/cnpj.js";
+import { GET as holidays } from "../handlers/v1/holidays/index.js";
+import { GET as businessDays } from "../handlers/v1/holidays/business-days.js";
+import { POST as cpf } from "../handlers/v1/validate/cpf.js";
+import { GET as cnpjGet } from "../handlers/v1/validate/cnpj.js";
 import { call, jsonBody } from "./helpers.js";
 
 let store: Store;

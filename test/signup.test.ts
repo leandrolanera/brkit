@@ -10,8 +10,8 @@ import {
   verifySignup,
 } from "../lib/signup.js";
 import { createMemoryStore, setStore, type Store } from "../lib/store.js";
-import { POST as signup } from "../api/v1/signup/index.js";
-import { POST as signupVerify } from "../api/v1/signup/verify.js";
+import { POST as signup } from "../handlers/v1/signup/index.js";
+import { POST as signupVerify } from "../handlers/v1/signup/verify.js";
 import { jsonBody, withEnv } from "./helpers.js";
 
 let store: Store;
